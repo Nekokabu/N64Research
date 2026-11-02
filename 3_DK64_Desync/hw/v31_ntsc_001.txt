@@ -1,0 +1,127 @@
+# rdp_timing v25 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E3200; dma buffer at 0x7D0000; heap top 0x0E5000; display buffer at 0x04CA80; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	125
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1410869	1058147	1181238	0	640	92995
+X	mgc_p4_4316.bin	full	game	1459295	1094405	1181238	3242	1280	93723
+X	mgc_p4_4316.bin	tri_only	vi_off	1306217	979658	1181238	0	640	93008
+X	mgc_p4_4316.bin	tri_only	game	1349525	1012139	1181238	3242	1280	94184
+# Y lines: case, w, H, triangles, spans, clock (smallest of 3), ticks, clocks/span, clocks/triangle, VI probe. VI off, depth cleared far (all pass), 2cyc_tex_blend_z unless the case says otherwise
+# v24 cases: zfail = depth cleared nearest; no_zcmp / no_zupd / no_imrd = that mode bit off; fbzb_* = colour / depth buffers at those RDRAM addresses (adjacent = depth right after colour; bar = 0x200000 / 0x3DA800 as the game; bar_reloc / dk_reloc = as replayed in X); random_rows / random_cols = only the row / only the column random; 1cyc_atomic / 2cyc_atomic / dk_om_noatomic = ATOMIC_PRIM
+# Y cases: base = v22's W triangle (vertical edges at integer x, random position, 1/32 texel per pixel, constant shade/z); frac = edges at x+0.5; shear_half/two = all edges slanted 0.5/2 px per row (spans stay w wide); apex = real triangle, apex on top, base 2w (spans average w)
+#   aa = AA_EN; persp = TEX_PERSP; lod = TEX_LOD (tile 1 = tile 0); dither = rgb/alpha dither on; point = point sampling; cvg = ALPHA_CVG_SEL + CVG_DST full; bar_om = BAR's other modes 0x182c0f/0x0c182078; dk_om = DK64's 0x882c0f/0x00552078 (1-cycle)
+#   slopes = shade/texture (1 texel per pixel)/depth slopes nonzero; strip = triangles side by side along rows; same_place = every triangle at the same spot; state_every1/8 = Set_Other_Modes + Set_Combine before every / every 8th triangle; syncpipe_every1 = Sync_Pipe before every triangle; tile_every1 = Set_Tile + Set_Tile_Size + Sync_Tile before every triangle; load_every8 = Sync_Load + Load_Block (64 B) + Sync_Tile before every 8th
+#   ci4_tlut / rgba32_tex / i8_tex = texture format; op_0b/0d/09/08 = triangle command type (texture+z 14 words / shade+z 14 / z 6 / plain 4; the combiner reads the missing attribute from the previous one)
+Y	wo_rect320	8	8	512	4096	111786	83835	27.29	218.3	93077
+Y	wo_rect320	13	8	512	4096	123954	92961	30.26	242.1	92997
+Y	wo_rect320	16	8	512	4096	131165	98370	32.02	256.2	93003
+Y	wo_rect320	20	8	512	4096	141558	106163	34.56	276.5	93023
+Y	wo_rect320	32	8	512	4096	186990	140237	45.65	365.2	93011
+Y	wo_rect320	64	8	512	4096	316050	237032	77.16	617.3	93002
+Y	wo_rect640	8	8	512	4096	120197	90143	29.34	234.8	93015
+Y	wo_rect640	13	8	512	4096	129378	97028	31.59	252.7	92984
+Y	wo_rect640	16	8	512	4096	137777	103329	33.64	269.1	93005
+Y	wo_rect640	20	8	512	4096	148206	111149	36.18	289.5	93013
+Y	wo_rect640	32	8	512	4096	192773	144576	47.06	376.5	92987
+Y	wo_rect640	64	8	512	4096	318630	238968	77.79	622.3	93000
+Y	wo_apex320	8	8	512	4096	100986	75734	24.65	197.2	92982
+Y	wo_apex320	13	8	512	4096	119573	89675	29.19	233.5	92976
+Y	wo_apex320	16	8	512	4096	127913	95931	31.23	249.8	93046
+Y	wo_apex320	20	8	512	4096	143837	107873	35.12	280.9	92983
+Y	wo_apex320	32	8	512	4096	191537	143648	46.76	374.1	93047
+Y	wo_apex320	64	8	512	4096	324078	243053	79.12	633.0	92971
+Y	wo_apex640	8	8	512	4096	106001	79497	25.88	207.0	93036
+Y	wo_apex640	13	8	512	4096	124673	93500	30.44	243.5	92993
+Y	wo_apex640	16	8	512	4096	133338	99998	32.55	260.4	93056
+Y	wo_apex640	20	8	512	4096	149094	111816	36.40	291.2	93001
+Y	wo_apex640	32	8	512	4096	195162	146366	47.65	381.2	92977
+Y	wo_apex640	64	8	512	4096	325734	244295	79.52	636.2	93004
+Y	wo_rect320_h16	8	16	256	4096	104682	78507	25.56	408.9	93012
+Y	wo_rect320_h16	13	16	256	4096	115481	86607	28.19	451.1	92995
+Y	wo_rect320_h16	16	16	256	4096	123054	92286	30.04	480.7	92970
+Y	wo_rect320_h16	20	16	256	4096	134465	100845	32.83	525.3	93001
+Y	wo_rect320_h16	32	16	256	4096	180162	135117	43.98	703.8	92992
+Y	wo_rect320_h16	64	16	256	4096	309425	232065	75.54	1208.7	93030
+Y	wo_rect640_h16	8	16	256	4096	114630	85967	27.99	447.8	93034
+Y	wo_rect640_h16	13	16	256	4096	122177	91629	29.83	477.3	92985
+Y	wo_rect640_h16	16	16	256	4096	130398	97793	31.84	509.4	92982
+Y	wo_rect640_h16	20	16	256	4096	141197	105893	34.47	551.6	92997
+Y	wo_rect640_h16	32	16	256	4096	186221	139661	45.46	727.4	93011
+Y	wo_rect640_h16	64	16	256	4096	312402	234296	76.27	1220.3	93038
+Y	wo_apex640_h16	8	16	256	4096	102306	76724	24.98	399.6	92992
+Y	wo_apex640_h16	13	16	256	4096	120749	90558	29.48	471.7	92992
+Y	wo_apex640_h16	16	16	256	4096	127890	95913	31.22	499.6	92984
+Y	wo_apex640_h16	20	16	256	4096	144385	108262	35.25	564.0	93047
+Y	wo_apex640_h16	32	16	256	4096	188766	141570	46.09	737.4	92963
+Y	wo_apex640_h16	64	16	256	4096	318606	238949	77.78	1244.6	93004
+Y	wo_rows640	8	8	512	4096	105990	79488	25.88	207.0	92993
+Y	wo_rows640	13	8	512	4096	149453	112085	36.49	291.9	92983
+Y	wo_rows640	16	8	512	4096	136037	102024	33.21	265.7	93023
+Y	wo_rows640	20	8	512	4096	136025	102015	33.21	265.7	93039
+Y	wo_rows640	32	8	512	4096	191958	143963	46.86	374.9	93008
+Y	wo_rows640	64	8	512	4096	317082	237807	77.41	619.3	92956
+Y	wo_cols640	8	8	512	4096	120845	90629	29.50	236.0	93032
+Y	wo_cols640	13	8	512	4096	129726	97290	31.67	253.4	93008
+Y	wo_cols640	16	8	512	4096	137946	103455	33.68	269.4	93003
+Y	wo_cols640	20	8	512	4096	148494	111365	36.25	290.0	92971
+Y	wo_cols640	32	8	512	4096	193457	145089	47.23	377.8	93013
+Y	wo_cols640	64	8	512	4096	319025	239265	77.89	623.1	92983
+Y	wo_strip640	8	8	512	4096	112422	84312	27.45	219.6	93015
+Y	wo_strip640	13	8	512	4096	130037	97523	31.75	254.0	92955
+Y	wo_strip640	16	8	512	4096	132977	99729	32.47	259.7	93023
+Y	wo_strip640	20	8	512	4096	142997	107244	34.91	279.3	93002
+Y	wo_strip640	32	8	512	4096	197489	148112	48.22	385.7	92989
+Y	wo_strip640	64	8	512	4096	319914	239931	78.10	624.8	92978
+Y	wo_same640	8	8	512	4096	104921	78687	25.62	204.9	93033
+Y	wo_same640	13	8	512	4096	149549	112157	36.51	292.1	92995
+Y	wo_same640	16	8	512	4096	136734	102546	33.38	267.1	92999
+Y	wo_same640	20	8	512	4096	136722	102537	33.38	267.0	93037
+Y	wo_same640	32	8	512	4096	192173	144125	46.92	375.3	92982
+Y	wo_same640	64	8	512	4096	317873	238400	77.61	620.8	92993
+Y	wo_slopes640	8	8	512	4096	120221	90161	29.35	234.8	93059
+Y	wo_slopes640	13	8	512	4096	129413	97055	31.59	252.8	92996
+Y	wo_slopes640	16	8	512	4096	137693	103265	33.62	268.9	93024
+Y	wo_slopes640	20	8	512	4096	148194	111141	36.18	289.4	92983
+Y	wo_slopes640	32	8	512	4096	192858	144638	47.08	376.7	93003
+Y	wo_slopes640	64	8	512	4096	318570	238922	77.78	622.2	92984
+Y	wo_shade640	8	8	512	4096	115962	86966	28.31	226.5	92993
+Y	wo_shade640	13	8	512	4096	125490	94113	30.64	245.1	92994
+Y	wo_shade640	16	8	512	4096	134646	100979	32.87	263.0	93037
+Y	wo_shade640	20	8	512	4096	145974	109476	35.64	285.1	92983
+Y	wo_shade640	32	8	512	4096	190433	142820	46.49	371.9	93004
+Y	wo_shade640	64	8	512	4096	316422	237312	77.25	618.0	92985
+Y	wo_edge640	8	8	512	4096	111114	83330	27.13	217.0	93010
+Y	wo_edge640	13	8	512	4096	120522	90386	29.42	235.4	93011
+Y	wo_edge640	16	8	512	4096	130181	97631	31.78	254.3	92981
+Y	wo_edge640	20	8	512	4096	142097	106569	34.69	277.5	92985
+Y	wo_edge640	32	8	512	4096	186666	139995	45.57	364.6	93028
+Y	wo_edge640	64	8	512	4096	313109	234828	76.44	611.5	92983
+Y	blend320	8	8	512	4096	224417	168308	54.79	438.3	92983
+Y	blend320	13	8	512	4096	266057	199538	64.96	519.6	93011
+Y	blend320	16	8	512	4096	290945	218204	71.03	568.3	92956
+Y	blend320	20	8	512	4096	317849	238383	77.60	620.8	92980
+Y	blend320	32	8	512	4096	397962	298467	97.16	777.3	93005
+Y	blend320	64	8	512	4096	654905	491174	159.89	1279.1	92985
+Y	blend640	8	8	512	4096	247781	185831	60.49	483.9	93031
+Y	blend640	13	8	512	4096	284790	213588	69.53	556.2	92979
+Y	blend640	16	8	512	4096	302226	226664	73.79	590.3	93040
+Y	blend640	20	8	512	4096	336605	252450	82.18	657.4	93026
+Y	blend640	32	8	512	4096	418157	313614	102.09	816.7	93006
+Y	blend640	64	8	512	4096	673073	504801	164.32	1314.6	93038
+Y	wo_rect512	8	8	512	4096	116622	87462	28.47	227.8	93016
+Y	wo_rect512	13	8	512	4096	127841	95876	31.21	249.7	92975
+Y	wo_rect512	16	8	512	4096	134598	100943	32.86	262.9	93005
+Y	wo_rect512	20	8	512	4096	145566	109169	35.54	284.3	93049
+Y	wo_rect512	32	8	512	4096	189906	142424	46.36	370.9	92972
+Y	wo_rect512	64	8	512	4096	317189	237888	77.44	619.5	93005

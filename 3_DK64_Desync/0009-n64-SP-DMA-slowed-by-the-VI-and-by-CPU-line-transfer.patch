@@ -1,0 +1,134 @@
+From 1d6ded68fbf892080d7c4333d16c6c8b854c354d Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 08:29:00 +0900
+Subject: [PATCH 09/12] n64: SP DMA slowed by the VI and by CPU line transfers;
+ the RDP only gets 36 clocks between DMAs (rsp_timing v19/v19b)
+
+rsp_timing v19 ran the v16 DMA kernels beside a drawing RDP, the VI in a 320x240
+anti-aliased mode and a CPU chasing pointers through RDRAM. The RDP hardly slows a DMA
+(0..5%), the VI mode adds 18% (4% in the replicate mode the test ROM displays with), and
+the CPU's cache line transfers add about 18 RCP clocks each while the DMA is in flight,
+the transfer itself waiting about 19 cycles; a 3.5 KiB DMA beside a cache-missing CPU
+takes 1.94x as long. Apply the VI factor when a DMA is queued and trade the penalties
+when a CPU line transfer overlaps a busy DMA. The RSP's own instruction timing is
+unaffected by any of this.
+
+v19b timed fixed RDP lists while the RSP issued DMAs back to back: whatever the DMA
+size (8 B to 3.5 KiB), the RDP gets about 36 clocks of bus per DMA, i.e. it loses the
+whole DMA minus that gap (8 B: 6, 64 B: 10, 512 B: 76, 3.5 KiB: 549 clocks; a 28 ms
+fill list takes 16x as long beside continuous 3.5 KiB DMAs). The per-8-byte loss was
+right (1.22) but each transfer costs 6 more, and the DMA's own byte rate is 0.15 RSP
+cycles per byte (3.6 system clocks per 8 bytes), not 0.167.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/cpu/cpu.cpp    |  4 ++++
+ ares/n64/rdp/rdp.hpp    |  3 ++-
+ ares/n64/rdp/timing.cpp |  2 +-
+ ares/n64/rsp/dma.cpp    |  9 +++++----
+ ares/n64/rsp/rsp.hpp    | 14 +++++++++++---
+ 5 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index d41057c0..cdec3a4c 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -196,6 +196,10 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
+   u32 total = 0;
+   if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
++  if(rdp.timing.enable && rsp.dma.busy.any()) {  //an SP DMA in flight: the two transfers delay each other (rsp_timing v19)
++    rsp.dma.clock -= RSP::DmaCpuPenaltyClocks;
++    total += RSP::DmaCpuStallCycles;
++  }
+   if(rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze) {
+     rdp.timingDelay(rdpClocks * rdp.contendScale());  //and the RDP loses the bus for the transfer
+     total += cycles;
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index a81acac1..adbd9753 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -109,7 +109,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
+     f64    contendCpuW = 1.0;      //a CPU data cache write-back (16 bytes; rdp_timing v17: a random load+store loop costs the RDP about two fills' worth, not two fills and two write-backs)
+     f64    contendCpuU = 4.0;      //an uncached CPU write (rdp_timing v17: 2.7 with the VI off, 5 in the games' VI mode)
+-    f64    contendDma = 1.22;      //per 8 bytes of SP DMA (64 B: 10, 512 B: 77, 4 KiB: 656)
++    f64    contendDma = 1.2;       //per 8 bytes of SP DMA, plus contendDmaBase per transfer: the RDP only gets about 36 clocks of
++    f64    contendDmaBase = 6.0;   //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 5507babf..f6846f62 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -57,7 +57,7 @@ auto RDP::timingReset() -> void {
+   timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+   timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
+-  timing.contendDma = t.contendDma;
++  timing.contendDma = t.contendDma; timing.contendDmaBase = t.contendDmaBase;
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto;
+   timing.colorSize = 2;
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 7fca587a..ce3ff6c7 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -1,4 +1,5 @@
+ auto RSP::dmaQueue(u32 clocks, Thread& thread) -> void {
++  if(rdp.timing.enable && vi.active()) clocks = (u32)(clocks * (vi.io.antialias < 2 ? DmaViFactor : DmaViFactorAA3));
+   dma.clock = (Thread::clock - thread.clock) - clocks;
+ }
+ 
+@@ -17,8 +18,8 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+     dma.current = dma.pending;
+     dma.busy    = dma.full;
+     dma.full    = {0,0};
+-    dmaQueue((dma.current.length+8) / 8 * DmaClocksPer8Bytes + DmaClocksPerTransfer, thread);
+-    rdp.timingDelay((dma.current.length+8) / 8 * rdp.timing.contendDma);  //the RDP loses the bus meanwhile
++    dmaQueue(dmaClocks(dma.current.length) + DmaClocksPerTransfer, thread);
++    rdp.timingDelay(rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma);  //the RDP loses the bus meanwhile
+   }
+ }
+ 
+@@ -65,8 +66,8 @@ auto RSP::dmaTransferStep() -> void {
+   if(dma.current.count) {
+     dma.current.count -= 1;
+     dma.current.dramAddress += dma.current.skip;
+-    dmaQueue((dma.current.length+8) / 8 * DmaClocksPer8Bytes, *this);
+-    rdp.timingDelay((dma.current.length+8) / 8 * rdp.timing.contendDma);
++    dmaQueue(dmaClocks(dma.current.length), *this);
++    rdp.timingDelay(rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma);
+   } else {
+     dma.busy = {0,0};
+     dma.current.length = 0xFF8;
+diff --git a/ares/n64/rsp/rsp.hpp b/ares/n64/rsp/rsp.hpp
+index 0dcce652..c7655458 100644
+--- a/ares/n64/rsp/rsp.hpp
++++ b/ares/n64/rsp/rsp.hpp
+@@ -261,9 +261,17 @@ struct RSP : Thread, Memory::RCP<RSP> {
+   } pipeline;
+ 
+   //dma.cpp
+-  //an SP DMA takes 38 RSP cycles plus 0.155 per byte on hardware (rsp_timing v16: 8 B 38, 64 B 44,
+-  //256 B 70, 1 KiB 186, 3.5 KiB 588; writes to RDRAM 32 + 0.145/B), in system clocks (3 per RSP cycle):
+-  enum : u32 { DmaClocksPer8Bytes = 4, DmaClocksPerTransfer = 114 };
++  //an SP DMA takes 38 RSP cycles plus 0.15 per byte on hardware (rsp_timing v16/v19b: 8 B 38, 64 B 44,
++  //256 B 70, 512 B 108, 1 KiB 186, 3.5 KiB 581; writes to RDRAM 32 + 0.145/B), in system clocks (3 per
++  //RSP cycle): 114 + 3.6 per 8 bytes
++  enum : u32 { DmaClocksPerTransfer = 114 };
++  static constexpr auto dmaClocks(u32 length) -> u32 { return (length + 8) * 9 / 20; }  //3.6 per 8 bytes
++  //the DMA shares RDRAM with the VI and the CPU (rsp_timing v19): in the games' 320x240 AA modes it takes
++  //18% longer (4% in the ROM's replicate mode), and every CPU cache line transfer that overlaps it delays
++  //it by about 18 RCP clocks while that transfer itself waits about 19 CPU cycles (a 3.5 KiB DMA beside a
++  //CPU chasing pointers takes 1.94x as long, and the CPU's fills 65 cycles instead of 46)
++  static constexpr f64 DmaViFactor = 1.12, DmaViFactorAA3 = 1.04;
++  enum : u32 { DmaCpuPenaltyClocks = 54, DmaCpuStallCycles = 19 };  //54 system clocks = 18 RCP clocks
+   auto dmaQueue(u32 clocks, Thread& thread) -> void;
+   auto dmaStep(u32 clocks) -> void;
+   auto dmaTransferStart(Thread& thread) -> void;
+-- 
+2.43.0
+

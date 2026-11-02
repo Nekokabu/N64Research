@@ -1,0 +1,119 @@
+From b6c72090714e6eaad208147b25fb510848850a22 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Tue, 27 Oct 2026 20:20:28 +0900
+Subject: [PATCH 03/12] n64: stall CPU cache line transfers while the RDP is
+ drawing
+
+With the RDP timing model in place, the CPU still ran at its idle speed while
+the RDP was busy. On hardware the RDP's color/depth traffic delays the CPU's
+own RDRAM transfers: measured with the rdp_timing v8 test ROM (CPU loops timed
+with the COP0 count register while a long RDP list is drawing, NTSC and PAL
+consoles, identical results), an instruction cache fill takes about 10 CPU
+cycles longer, a data cache fill 4 and a data cache write-back 10 to 25
+(12 used); uncached accesses and the ALU are not affected in a way that
+matters for games. The stall is only charged while the RDP timing model has
+work pending and the RDP is not frozen, so with the model disabled nothing
+changes.
+
+The recompiler's inline instruction cache fill gains a call to the stall
+helper on its miss path; the interpreter and the data cache go through the
+existing fill/write-back functions.
+
+Checked against 60fps captures of a console: the Beetle Adventure Racing
+intro's helicopter crash now happens within a frame of the hardware (it was
+about 20 frames early with the RDP model alone), and the Donkey Kong 64
+attract demo still plays back correctly.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/cpu/cpu.cpp        | 9 +++++++++
+ ares/n64/cpu/cpu.hpp        | 9 ++++++++-
+ ares/n64/cpu/dcache.cpp     | 4 ++--
+ ares/n64/cpu/recompiler.cpp | 1 +
+ 4 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index 41964d49..bacdae50 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -192,6 +192,15 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+   icache.line(vaddr).fill(paddr, *this);
+ }
+ 
++auto CPU::rdpBusyStall(u32 cycles) -> u32 {
++  return rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze ? cycles : 0;
++}
++
++//the recompiler's inline instruction cache fill: the stall part of the fill time
++auto CPU::icacheStall() -> void {
++  if(u32 cycles = rdpBusyStall(ICacheFillStall)) step(cycles * 2);
++}
++
+ template<bool Recompiled>
+ auto CPU::instructionEpilogue() -> void {
+   if constexpr(!Recompiled) {
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index b51000d9..f585846f 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -54,6 +54,13 @@ struct CPU : Thread {
+   auto raiseCoprocessor1Exception() -> void;
+   auto icacheFillLine(u64 vaddr, u32 paddr) -> void;
+ 
++  //cache line transfers wait for RDRAM behind the RDP while it is drawing (measured on
++  //hardware with rdp_timing v8: an instruction cache fill takes 10 CPU cycles longer, a
++  //data cache fill 4, a data cache write-back 12; otherwise the CPU is not slowed down)
++  auto rdpBusyStall(u32 cycles) -> u32;
++  auto icacheStall() -> void;
++  enum : u32 { ICacheFillStall = 10, DCacheFillStall = 4, DCacheWriteBackStall = 12 };
++
+   auto power(bool reset) -> void;
+ 
+   struct Pipeline {
+@@ -206,7 +213,7 @@ struct CPU : Thread {
+       }
+ 
+       auto fill(u32 paddr, CPU& cpu) -> void {
+-        cpu.step(48 * 2);
++        cpu.step((48 + cpu.rdpBusyStall(ICacheFillStall)) * 2);
+         const u32 tag = paddr & ~0x0000'0fffu;
+         tagKey = tag;
+         setValid(true);
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index 4de28e0a..7f8ac0e1 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -4,7 +4,7 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
+ }
+ 
+ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+-  cpu.step(40 * 2);
++  cpu.step((40 + cpu.rdpBusyStall(DCacheFillStall)) * 2);
+   const u32 tag = paddr & ~0x0000'0fffu;
+   dirty  = 0;
+   tagKey = tag;
+@@ -13,7 +13,7 @@ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+ }
+ 
+ auto CPU::DataCache::Line::writeBack() -> void {
+-  cpu.step(40 * 2);
++  cpu.step((40 + cpu.rdpBusyStall(DCacheWriteBackStall)) * 2);
+   const u32 tag = tagKey & ~0x0000'0fffu;
+   cpu.busWriteBurst<DCache>(tag | index, words);
+ }
+diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
+index b84272aa..6e624e39 100644
+--- a/ares/n64/cpu/recompiler.cpp
++++ b/ares/n64/cpu/recompiler.cpp
+@@ -823,6 +823,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+           if(!sdram) add64(mem0(RdramRbusIcacheReadsAddr), mem0(RdramRbusIcacheReadsAddr), imm(ICache));
+         }
+         emitCpuStep(96);
++        callf(&CPU::icacheStall);
+         mov32(IcacheTagKeyMem(lineIndex), imm(tagKey));
+         mov64(reg(1), mem0(ramDataField));
+         mov128(IcacheLineWordsMem(lineIndex, 0x00), mem(reg(1), sljit_sw(ramByteOff + 0x00)));
+-- 
+2.43.0
+

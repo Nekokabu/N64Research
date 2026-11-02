@@ -1,0 +1,1182 @@
+From 100996eb1d47fcdced922ee16a47072d4f2d6ea6 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 03:45:23 +0900
+Subject: [PATCH 05/12] n64: CPU instruction timing from hardware (cpu_timing
+ v11, v14)
+
+Two test ROMs time loops of VR4300 instructions with the COP0 count on NTSC and PAL
+consoles (identical to the cycle). Against ares:
+
+- The recompiler charged an instruction that took a slow path (cache miss, uncached
+  access) one cycle twice: the slow path adds the cycles deferred up to the resume
+  point, and the fast path flushed the same cycles again after it. Settle them before
+  the resume label.
+- The FPU is pipelined. add.s/sub.s/mul.s and their double forms issue in 2 cycles
+  (ares: 3/5/8) and a dependent instruction waits until the result is ready 3 cycles
+  after issue; conversions take 5; div.s and sqrt.s 29, sqrt.d 30 (ares: 58; div.d is
+  assumed to match); a compare costs 1 (the recompiler charged 3). The recompiler
+  schedules the dependency stalls per block (loads into FPU registers and stores/moves
+  out of them included); the interpreter charges the issue cost.
+- A data cache hit costs no extra cycle (ares charged 1 per load and store). What does
+  cost a cycle: a load whose result the next instruction uses (not a branch), a store
+  followed by another memory instruction, mfc0 of Count, mtc0, and the nullified delay
+  slot of a likely branch that is not taken.
+- An uncached RDRAM read stalls for 32 cycles (ares: 1-2); an RCP register read for 23
+  (ares: 21).
+
+With these the v11/v14 loops agree with the console to within 1-2 cycles per iteration,
+except where the FPU's cost depends on operand values (add/sub with cancellation, a 0.0
+dividend) and the 4-entry write buffer, which is not modelled (a burst of more than four
+uncached stores costs ~16 cycles per extra store on the console).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/cpu/cpu.cpp             |  44 +++++++++++
+ ares/n64/cpu/cpu.hpp             |  16 +++-
+ ares/n64/cpu/dcache.cpp          |   2 -
+ ares/n64/cpu/interpreter-fpu.cpp |  68 ++++++++--------
+ ares/n64/cpu/memory.cpp          |   1 +
+ ares/n64/cpu/recompiler-fpu.cpp  | 132 +++++++++++++++----------------
+ ares/n64/cpu/recompiler-ipu.cpp  |   3 +-
+ ares/n64/cpu/recompiler.cpp      |  53 ++++++++++++-
+ ares/n64/memory/io.hpp           |   2 +-
+ 9 files changed, 214 insertions(+), 107 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index 6c0a21b1..d1ad3bdd 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -203,6 +203,50 @@ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
+   return total;
+ }
+ 
++//result latency of a COP1 arithmetic instruction in cycles (cpu_timing v11/v14); 0 = not one
++auto CPU::fpuLatency(u32 instruction) const -> u32 {
++  if((instruction >> 26) != 0x11 || !(instruction >> 25 & 1)) return 0;
++  u32 fmt = instruction >> 21 & 31, fn = instruction & 0x3f;
++  bool dbl = fmt == 17 || fmt == 21;
++  switch(fn) {
++  case 0x00: case 0x01: case 0x02: return 3;          //add, sub, mul
++  case 0x03: return dbl ? 30 : 29;                    //div (div.s measured 28-29; div.d assumed like sqrt.d)
++  case 0x04: return dbl ? 30 : 29;                    //sqrt (measured 28-29 and 30)
++  case 0x05: case 0x06: case 0x07: return 1;          //abs, mov, neg
++  case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: return 5;  //round/trunc/ceil/floor
++  case 0x20: case 0x21: case 0x24: case 0x25: return 5;  //cvt
++  default: return fn >= 0x30 ? 1 : 0;                 //compares
++  }
++}
++
++//pipeline hazards (cycles) between an instruction and the one that follows it in memory
++auto CPU::hazardCycles(u32 instruction, u32 next) -> u32 {
++  auto op = instruction >> 26;
++  auto isLoad = [](u32 o) { return (o >= 0x20 && o <= 0x27) || o == 0x37 || o == 0x1a || o == 0x1b || o == 0x30 || o == 0x34 || o == 0x31 || o == 0x35; };
++  auto isStore = [](u32 o) { return (o >= 0x28 && o <= 0x2f) || o == 0x38 || o == 0x3c || o == 0x39 || o == 0x3d; };
++  u32 cycles = 0;
++  if(op == 0x10 && (instruction >> 21 & 31) <= 1 && (instruction >> 11 & 31) == 9) cycles += 1;  //MFC0 Count costs 2 (Status: 1)
++  if(op == 0x10 && ((instruction >> 21 & 31) == 4 || (instruction >> 21 & 31) == 5)) cycles += 1;  //MTC0/DMTC0 cost 2
++  if(!next) return cycles;
++  auto nop = next >> 26;
++  if(isStore(op) && (isLoad(nop) || isStore(nop) || nop == 0x2f)) return cycles + 1;  //the store occupies the data cache for one more cycle
++  if(!isLoad(op)) return cycles;
++  if(op == 0x31 || op == 0x35) return cycles;  //LWC1/LDC1: handled by the FPU scoreboard
++  u32 rt = instruction >> 16 & 31;
++  if(rt == 0) return cycles;
++  u32 nrs = next >> 21 & 31, nrt = next >> 16 & 31;
++  bool readsRs = !(nop == 0x02 || nop == 0x03 || nop == 0x0f || nop == 0x10 || nop == 0x11 || nop == 0x12);
++  bool readsRt = nop == 0x00 || isStore(nop) || (nop == 0x10 && (nrs == 4 || nrs == 5)) || (nop == 0x11 && (nrs == 4 || nrs == 5 || nrs == 6));
++  if(nop == 0x00) {  //SPECIAL: JR/JALR and SLL/SRL/SRA (rs field is the shift amount) read differently
++    u32 fn = next & 0x3f;
++    if(fn == 0x08 || fn == 0x09) return cycles;  //measured: lw ra; jr ra costs nothing extra
++    if(fn <= 0x03) readsRs = false;
++  }
++  if(nop == 0x01 || nop == 0x04 || nop == 0x05 || nop == 0x14 || nop == 0x15 || nop == 0x06 || nop == 0x07 || nop == 0x16 || nop == 0x17) return cycles;  //branches
++  if((readsRs && nrs == rt) || (readsRt && nrt == rt)) cycles += 1;
++  return cycles;
++}
++
+ auto CPU::icacheBusyStall() -> u32 {
+   viStallCycles = ViStallIFill;
+   u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI);
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index dc533cac..9d801d1b 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -75,6 +75,20 @@ struct CPU : Thread {
+   bool wbPending = false;
+   auto busNow() const -> s64 { return clockEpoch + Thread::clock; }
+   auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); }
++  //an uncached RDRAM read stalls the pipeline for 32 cycles in all (cpu_timing v14; nemu64-test agrees)
++  enum : u32 { UncachedReadCycles = 31 };
++  //FPU costs measured with cpu_timing v11/v14: the FPU is pipelined. add/sub/mul (single and double)
++  //issue in 2 cycles and their result is ready 3 cycles after issue; conversions take 5; div.s and
++  //sqrt.s 29, the double forms 30; compares 1. 'issue' is what the instruction itself costs, the
++  //dependency stalls are scheduled per block by the recompiler (fpuLatency) and are not charged by
++  //the interpreter.
++  auto fpuCycles(u32 issue) const -> u32 { return (issue - 1) * 2; }
++  auto fpuLatency(u32 instruction) const -> u32;
++  //pipeline hazards measured with cpu_timing v11/v14: a load followed by an instruction that uses
++  //its result costs 1 more cycle, a store followed by another memory instruction 1 more, mfc0 of
++  //Count and mtc0 1 more; a likely branch that is not taken still spends the cycle of the
++  //nullified delay slot
++  auto hazardCycles(u32 instruction, u32 next) -> u32;
+ 
+   auto power(bool reset) -> void;
+ 
+@@ -95,7 +109,7 @@ struct CPU : Thread {
+     auto branch(u64 address) -> void { nextpc = address; nstate |= DelaySlot | EndBlock; }
+     auto noBranch() -> void { nstate |= DelaySlot; }
+     auto exception() -> void { state |= EndBlock; }
+-    auto skip() -> void { pc += 4; nextpc = pc + 4; state |= EndBlock; }
++    auto skip() -> void { pc += 4; nextpc = pc + 4; state |= EndBlock; self.step(1 * 2); }  //the nullified delay slot still spends its cycle
+     auto begin() -> void {
+       nstate = 0;
+       pc = nextpc;
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index ae205855..a39b6a6d 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -68,7 +68,6 @@ auto CPU::DataCache::read(u64 vaddr, u32 paddr) -> u64 {
+     line.fill(paddr);
+     self.profile.dcacheMisses++;
+   } else {
+-    cpu.step(1 * 2);
+     self.profile.dcacheHits++;
+   }
+   return line.read<Size>(paddr);
+@@ -97,7 +96,6 @@ auto CPU::DataCache::write(u64 vaddr, u32 paddr, u64 data) -> void {
+     line.fill(paddr);
+     self.profile.dcacheMisses++;
+   } else {
+-    cpu.step(1 * 2);
+     self.profile.dcacheHits++;
+   }
+   line.write<Size>(paddr, data);
+diff --git a/ares/n64/cpu/interpreter-fpu.cpp b/ares/n64/cpu/interpreter-fpu.cpp
+index a4e23e4b..c5d31956 100644
+--- a/ares/n64/cpu/interpreter-fpu.cpp
++++ b/ares/n64/cpu/interpreter-fpu.cpp
+@@ -467,7 +467,7 @@ auto CPU::FADD_S(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f32, ffd, FS(f32) + FT(f32));
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((3 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FADD_D(u8 fd, u8 fs, u8 ft) -> void {
+@@ -477,7 +477,7 @@ auto CPU::FADD_D(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f64, ffd, ffs + fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((3 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FCEIL_L_S(u8 fd, u8 fs) -> void {
+@@ -486,7 +486,7 @@ auto CPU::FCEIL_L_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundCeil<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCEIL_L_D(u8 fd, u8 fs) -> void {
+@@ -495,7 +495,7 @@ auto CPU::FCEIL_L_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundCeil<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCEIL_W_S(u8 fd, u8 fs) -> void {
+@@ -504,7 +504,7 @@ auto CPU::FCEIL_W_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundCeil<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCEIL_W_D(u8 fd, u8 fs) -> void {
+@@ -513,7 +513,7 @@ auto CPU::FCEIL_W_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundCeil<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ #define  XORDERED(type, value, quiet) \
+@@ -712,7 +712,7 @@ auto CPU::FCVT_S_W(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f32, ffd, ffs);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_S_L(u8 fd, u8 fs) -> void {
+@@ -725,7 +725,7 @@ auto CPU::FCVT_S_L(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f32, ffd, (f32)ffs);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_D_S(u8 fd, u8 fs) -> void {
+@@ -748,7 +748,7 @@ auto CPU::FCVT_D_W(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f64, ffd, (f64)ffs);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_D_L(u8 fd, u8 fs) -> void {
+@@ -761,7 +761,7 @@ auto CPU::FCVT_D_L(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f64, ffd, (f64)ffs);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_L_S(u8 fd, u8 fs) -> void {
+@@ -770,7 +770,7 @@ auto CPU::FCVT_L_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundCurrent<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_L_D(u8 fd, u8 fs) -> void {
+@@ -779,7 +779,7 @@ auto CPU::FCVT_L_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundCurrent<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_W_S(u8 fd, u8 fs) -> void {
+@@ -788,7 +788,7 @@ auto CPU::FCVT_W_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundCurrent<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FCVT_W_D(u8 fd, u8 fs) -> void {
+@@ -797,7 +797,7 @@ auto CPU::FCVT_W_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundCurrent<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FDIV_S(u8 fd, u8 fs, u8 ft) -> void {
+@@ -807,7 +807,7 @@ auto CPU::FDIV_S(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f32, ffd, ffs / fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((29 - 1) * 2);
++  step(fpuCycles(29));
+ }
+ 
+ auto CPU::FDIV_D(u8 fd, u8 fs, u8 ft) -> void {
+@@ -817,7 +817,7 @@ auto CPU::FDIV_D(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f64, ffd, ffs / fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((58 - 1) * 2);
++  step(fpuCycles(30));
+ }
+ 
+ auto CPU::FFLOOR_L_S(u8 fd, u8 fs) -> void {
+@@ -826,7 +826,7 @@ auto CPU::FFLOOR_L_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundFloor<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FFLOOR_L_D(u8 fd, u8 fs) -> void {
+@@ -835,7 +835,7 @@ auto CPU::FFLOOR_L_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s64>(ffs)) return;
+   CHECK_FPE(s64, ffd, roundFloor<s64>(ffs));
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FFLOOR_W_S(u8 fd, u8 fs) -> void {
+@@ -844,7 +844,7 @@ auto CPU::FFLOOR_W_S(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundFloor<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FFLOOR_W_D(u8 fd, u8 fs) -> void {
+@@ -853,7 +853,7 @@ auto CPU::FFLOOR_W_D(u8 fd, u8 fs) -> void {
+   if(!fpuCheckInputConv<s32>(ffs)) return;
+   CHECK_FPE_CONV(s32, ffd, roundFloor<s32>(ffs));
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FMOV_S(u8 fd, u8 fs) -> void {
+@@ -872,7 +872,7 @@ auto CPU::FMUL_S(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f32, ffd, ffs * fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FMUL_D(u8 fd, u8 fs, u8 ft) -> void {
+@@ -882,7 +882,7 @@ auto CPU::FMUL_D(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f64, ffd, ffs * fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((8 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FNEG_S(u8 fd, u8 fs) -> void {
+@@ -910,7 +910,7 @@ auto CPU::FROUND_L_S(u8 fd, u8 fs) -> void {
+   CHECK_FPE(s64, ffd, roundNearest<s64>(ffs));
+   if(ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FROUND_L_D(u8 fd, u8 fs) -> void {
+@@ -920,7 +920,7 @@ auto CPU::FROUND_L_D(u8 fd, u8 fs) -> void {
+   CHECK_FPE(s64, ffd, roundNearest<s64>(ffs));
+   if(ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FROUND_W_S(u8 fd, u8 fs) -> void {
+@@ -930,7 +930,7 @@ auto CPU::FROUND_W_S(u8 fd, u8 fs) -> void {
+   CHECK_FPE_CONV(s32, ffd, roundNearest<s32>(ffs));
+   if(ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FROUND_W_D(u8 fd, u8 fs) -> void {
+@@ -940,7 +940,7 @@ auto CPU::FROUND_W_D(u8 fd, u8 fs) -> void {
+   CHECK_FPE_CONV(s32, ffd, roundNearest<s32>(ffs));
+   if(ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FSQRT_S(u8 fd, u8 fs) -> void {
+@@ -950,7 +950,7 @@ auto CPU::FSQRT_S(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f32, ffd, squareRoot(ffs));
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((29 - 1) * 2);
++  step(fpuCycles(29));
+ }
+ 
+ auto CPU::FSQRT_D(u8 fd, u8 fs) -> void {
+@@ -960,7 +960,7 @@ auto CPU::FSQRT_D(u8 fd, u8 fs) -> void {
+   CHECK_FPE(f64, ffd, squareRoot(ffs));
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((58 - 1) * 2);
++  step(fpuCycles(30));
+ }
+ 
+ auto CPU::FSUB_S(u8 fd, u8 fs, u8 ft) -> void {
+@@ -970,7 +970,7 @@ auto CPU::FSUB_S(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f32, ffd, ffs - fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f32) = ffd;
+-  step((3 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FSUB_D(u8 fd, u8 fs, u8 ft) -> void {
+@@ -980,7 +980,7 @@ auto CPU::FSUB_D(u8 fd, u8 fs, u8 ft) -> void {
+   CHECK_FPE(f64, ffd, ffs - fft);
+   if(!fpuCheckOutput(ffd)) return;
+   FD(f64) = ffd;
+-  step((3 - 1) * 2);
++  step(fpuCycles(2));
+ }
+ 
+ auto CPU::FTRUNC_L_S(u8 fd, u8 fs) -> void {
+@@ -990,7 +990,7 @@ auto CPU::FTRUNC_L_S(u8 fd, u8 fs) -> void {
+   CHECK_FPE(s64, ffd, roundTrunc<s64>(ffs));
+   if((f32)ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FTRUNC_L_D(u8 fd, u8 fs) -> void {
+@@ -1000,7 +1000,7 @@ auto CPU::FTRUNC_L_D(u8 fd, u8 fs) -> void {
+   CHECK_FPE(s64, ffd, roundTrunc<s64>(ffs));
+   if((f64)ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s64) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FTRUNC_W_S(u8 fd, u8 fs) -> void {
+@@ -1010,7 +1010,7 @@ auto CPU::FTRUNC_W_S(u8 fd, u8 fs) -> void {
+   CHECK_FPE_CONV(s32, ffd, roundTrunc<s32>(ffs));
+   if((f32)ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::FTRUNC_W_D(u8 fd, u8 fs) -> void {
+@@ -1020,7 +1020,7 @@ auto CPU::FTRUNC_W_D(u8 fd, u8 fs) -> void {
+   CHECK_FPE_CONV(s32, ffd, roundTrunc<s32>(ffs));
+   if((f64)ffd != ffs && fpeInexact()) return exception.floatingPoint();
+   FD(s32) = ffd;
+-  step((5 - 1) * 2);
++  step(fpuCycles(5));
+ }
+ 
+ auto CPU::LDC1(u8 ft, cr64& rs, s16 imm) -> void {
+diff --git a/ares/n64/cpu/memory.cpp b/ares/n64/cpu/memory.cpp
+index f362ef67..b84e811c 100644
+--- a/ares/n64/cpu/memory.cpp
++++ b/ares/n64/cpu/memory.cpp
+@@ -170,6 +170,7 @@ auto CPU::read(PhysAccess access) -> maybe<u64> {
+   u32 paddr = access.paddr;
+   if(context.littleEndian()) paddr = reverseEndianPaddr<Size>(paddr);
+   if(access.cache) return dcache.read<Size>(access.vaddr, paddr);
++  if(paddr < 0x03f0'0000) step(UncachedReadCycles * 2);  //RDRAM: the RCP devices charge their own cost
+   return busRead<Size>(paddr);
+ }
+ 
+diff --git a/ares/n64/cpu/recompiler-fpu.cpp b/ares/n64/cpu/recompiler-fpu.cpp
+index c2ed02c3..ffd72d61 100644
+--- a/ares/n64/cpu/recompiler-fpu.cpp
++++ b/ares/n64/cpu/recompiler-fpu.cpp
+@@ -1072,7 +1072,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FADD_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, (5 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1089,7 +1089,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSUB_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, (5 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1106,7 +1106,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FMUL_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, (5 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1123,7 +1123,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FDIV_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, (29 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(29),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1140,7 +1140,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSQRT_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn}, FpuWidth32, (29 - 1) * 2, FpuCheckSnan,
++      Fdn, {Fsn}, FpuWidth32, self.fpuCycles(29), FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+         fsqrt32_f0();
+@@ -1203,7 +1203,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FROUND_L_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S64(0u);
+       }
+@@ -1218,7 +1218,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FTRUNC_L_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S64(1u);
+       }
+@@ -1233,7 +1233,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCEIL_L_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S64(2u);
+       }
+@@ -1248,7 +1248,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FFLOOR_L_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::Linear;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S64(3u);
+       }
+@@ -1263,7 +1263,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FROUND_W_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S32(0u);
+       }
+@@ -1278,7 +1278,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FTRUNC_W_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S32(1u);
+       }
+@@ -1293,7 +1293,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCEIL_W_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S32(2u);
+       }
+@@ -1308,7 +1308,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FFLOOR_W_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF32S32(3u);
+       }
+@@ -1345,7 +1345,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_W_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+ #if defined(ARCHITECTURE_ARM64)
+         arm64FcvtS32FromF32(reg(1), freg(0), (u32)emitStateKey.fpuRoundMode() & 3u);
+@@ -1364,7 +1364,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_L_S, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF32, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF32, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+ #if defined(ARCHITECTURE_ARM64)
+         arm64FcvtS64FromF32(reg(1), freg(0), (u32)emitStateKey.fpuRoundMode() & 3u);
+@@ -1383,7 +1383,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_F_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareFalse
+     );
+   }
+@@ -1396,7 +1396,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_UN_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareFalse
+     );
+   }
+@@ -1409,7 +1409,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_EQ_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareEq
+     );
+   }
+@@ -1422,7 +1422,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_UEQ_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareEq
+     );
+   }
+@@ -1435,7 +1435,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_OLT_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareLt
+     );
+   }
+@@ -1448,7 +1448,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_ULT_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareLt
+     );
+   }
+@@ -1461,7 +1461,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_OLE_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareLe
+     );
+   }
+@@ -1474,7 +1474,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_ULE_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareLe
+     );
+   }
+@@ -1487,7 +1487,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_SF_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareFalse
+     );
+   }
+@@ -1500,7 +1500,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGLE_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareFalse
+     );
+   }
+@@ -1513,7 +1513,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_SEQ_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareEq
+     );
+   }
+@@ -1526,7 +1526,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGL_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareEq
+     );
+   }
+@@ -1539,7 +1539,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_LT_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::Linear;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareLt
+     );
+   }
+@@ -1552,7 +1552,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGE_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareLt
+     );
+   }
+@@ -1565,7 +1565,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_LE_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareLe
+     );
+   }
+@@ -1578,7 +1578,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGT_S, imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::Linear;
+       },
+-      Fsn, Ftn, FpuWidth32, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth32, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareLe
+     );
+   }
+@@ -1595,7 +1595,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FADD_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, (3 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1612,7 +1612,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSUB_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, (3 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1629,7 +1629,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FMUL_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, (8 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1646,7 +1646,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FDIV_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, (58 - 1) * 2,
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(30),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1663,7 +1663,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSQRT_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn}, FpuWidth64, (58 - 1) * 2, FpuCheckSnan,
++      Fdn, {Fsn}, FpuWidth64, self.fpuCycles(30), FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+         fsqrt64_f0();
+@@ -1726,7 +1726,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FROUND_L_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S64(0u);
+       }
+@@ -1741,7 +1741,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FTRUNC_L_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S64(1u);
+       }
+@@ -1756,7 +1756,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCEIL_L_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S64(2u);
+       }
+@@ -1771,7 +1771,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FFLOOR_L_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S64(3u);
+       }
+@@ -1786,7 +1786,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FROUND_W_D, imm(Fdn), imm(Fsn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S32(0u);
+       }
+@@ -1801,7 +1801,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FTRUNC_W_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S32(1u);
+       }
+@@ -1816,7 +1816,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCEIL_W_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S32(2u);
+       }
+@@ -1831,7 +1831,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FFLOOR_W_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+         emitFpuFixedRmToIntF64S32(3u);
+       }
+@@ -1868,7 +1868,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_W_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS32, self.fpuCycles(5),
+       [&]() -> void {
+ #if defined(ARCHITECTURE_ARM64)
+         arm64FcvtS32FromF64(reg(1), freg(0), (u32)emitStateKey.fpuRoundMode() & 3u);
+@@ -1887,7 +1887,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_L_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertF64, FpuConvertS64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertF64, FpuConvertS64, self.fpuCycles(5),
+       [&]() -> void {
+ #if defined(ARCHITECTURE_ARM64)
+         arm64FcvtS64FromF64(reg(1), freg(0), (u32)emitStateKey.fpuRoundMode() & 3u);
+@@ -1906,7 +1906,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_F_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareFalse
+     );
+   }
+@@ -1919,7 +1919,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_UN_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareFalse
+     );
+   }
+@@ -1932,7 +1932,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_EQ_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareEq
+     );
+   }
+@@ -1945,7 +1945,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_UEQ_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareEq
+     );
+   }
+@@ -1958,7 +1958,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_OLT_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareLt
+     );
+   }
+@@ -1971,7 +1971,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_ULT_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareLt
+     );
+   }
+@@ -1984,7 +1984,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_OLE_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareUnordered, FpuCompareLe
+     );
+   }
+@@ -1997,7 +1997,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_ULE_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareUnordered, FpuCompareLe
+     );
+   }
+@@ -2010,7 +2010,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_SF_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareFalse
+     );
+   }
+@@ -2023,7 +2023,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGLE_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareFalse
+     );
+   }
+@@ -2036,7 +2036,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_SEQ_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareEq
+     );
+   }
+@@ -2049,7 +2049,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGL_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareEq
+     );
+   }
+@@ -2062,7 +2062,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_LT_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareLt
+     );
+   }
+@@ -2075,7 +2075,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGE_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareLt
+     );
+   }
+@@ -2088,7 +2088,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_LE_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 0,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 0,
+       FpuCompareOrdered, FpuCompareLe
+     );
+   }
+@@ -2101,7 +2101,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FC_NGT_D, imm(Fsn), imm(Ftn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fsn, Ftn, FpuWidth64, (3 - 1) * 2, FpuCheckSnan | FpuCheckQnan, 1,
++      Fsn, Ftn, FpuWidth64, self.fpuCycles(1), FpuCheckSnan | FpuCheckQnan, 1,
+       FpuCompareOrdered, FpuCompareLe
+     );
+   }
+@@ -2130,7 +2130,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_S_W, imm(Fdn), imm(Fsn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertS32, FpuConvertF32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertS32, FpuConvertF32, self.fpuCycles(5),
+       [&]() -> void {
+         conv_f32_from_s32(freg(0), reg(0));
+       }
+@@ -2145,7 +2145,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_D_W, imm(Fdn), imm(Fsn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertS32, FpuConvertF64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertS32, FpuConvertF64, self.fpuCycles(5),
+       [&]() -> void {
+         conv_f64_from_s32(freg(0), reg(0));
+       }
+@@ -2175,7 +2175,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_S_L, imm(Fdn), imm(Fsn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertS64, FpuConvertF32, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertS64, FpuConvertF32, self.fpuCycles(5),
+       [&]() -> void {
+         conv_f32_from_sw(freg(0), reg(0));
+       }
+@@ -2190,7 +2190,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FCVT_D_L, imm(Fdn), imm(Fsn));
+       return EmitExecuteResult::MayFault;
+       },
+-      Fdn, Fsn, FpuConvertS64, FpuConvertF64, (5 - 1) * 2,
++      Fdn, Fsn, FpuConvertS64, FpuConvertF64, self.fpuCycles(5),
+       [&]() -> void {
+         conv_f64_from_sw(freg(0), reg(0));
+       }
+diff --git a/ares/n64/cpu/recompiler-ipu.cpp b/ares/n64/cpu/recompiler-ipu.cpp
+index a9cac538..47719890 100644
+--- a/ares/n64/cpu/recompiler-ipu.cpp
++++ b/ares/n64/cpu/recompiler-ipu.cpp
+@@ -163,8 +163,7 @@ auto CPU::Recompiler::jitMemoryOpcode(u32 instruction, u32 size, u32 mode,
+   cmp32(mem(reg(2), DcacheLineTagKeyOff), reg(3), set_z);
+   auto cacheMiss = jump(flag_nz);
+ 
+-  // Cache hit: account for the hit latency, then read/write the cached value.
+-  emitCpuStep(2);
++  // Cache hit: a hit costs no extra cycle (cpu_timing v11); the load-use hazard is charged per block.
+   if(system.homebrewMode) {
+     add64(ProfileDcacheHitsMem, ProfileDcacheHitsMem, imm(1));
+   }
+diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
+index 6e624e39..498b5ab0 100644
+--- a/ares/n64/cpu/recompiler.cpp
++++ b/ares/n64/cpu/recompiler.cpp
+@@ -680,6 +680,40 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+ 
+   // Phase 4: emit the planned instruction sequence.
+   bool prevBranched = false;
++  // Static FPU scoreboard for this block: the FPU is pipelined (cpu_timing v11/v14), an instruction
++  // that reads a result before it is ready waits. The schedule starts afresh at every block entry.
++  std::vector<u32> fpuStall(plan.instructions.size(), 0);
++  {
++    s64 ready[32] = {}; s64 t = 0;
++    for(size_t i = 0; i < plan.instructions.size(); i++) {
++      u32 ins = plan.instructions[i].instruction;
++      u32 op = ins >> 26, fs = ins >> 11 & 31, ft = ins >> 16 & 31, fd = ins >> 6 & 31;
++      if(u32 lat = self.fpuLatency(ins)) {
++        u32 fn = ins & 0x3f;
++        s64 need = ready[fs];
++        if(fn <= 0x03 || fn >= 0x30) need = max(need, ready[ft]);
++        s64 stall = max<s64>(0, need - t);
++        fpuStall[i] = (u32)stall; t += stall;
++        u32 issue = lat <= 3 ? 2 : lat;   //add/sub/mul issue 2; conversions (5) and div/sqrt are not pipelined
++        if(fn < 0x30) ready[fd] = t + lat;
++        t += issue;
++      } else if(op == 0x31 || op == 0x35) {  //LWC1/LDC1
++        t += 1; ready[ft] = t + 1;
++      } else if(op == 0x39 || op == 0x3d) {  //SWC1/SDC1
++        s64 stall = max<s64>(0, ready[ft] - t);
++        fpuStall[i] = (u32)stall; t += stall + 1;
++      } else if(op == 0x11 && (ins >> 21 & 31) <= 1) {  //MFC1/DMFC1
++        s64 stall = max<s64>(0, ready[fs] - t);
++        fpuStall[i] = (u32)stall; t += stall + 1;
++      } else if(op == 0x11 && ((ins >> 21 & 31) == 4 || (ins >> 21 & 31) == 5)) {  //MTC1/DMTC1
++        t += 1; ready[fs] = t;
++      } else {
++        u32 next = i + 1 < plan.instructions.size() ? plan.instructions[i + 1].instruction : 0;
++        t += 1 + self.hazardCycles(ins, next);
++      }
++    }
++  }
++
+   for(size_t idx = 0; idx < plan.instructions.size(); idx++) {
+     auto& ii = plan.instructions[idx];
+     bool firstInstruction = (idx == 0);
+@@ -746,6 +780,18 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+       instructionCycles = 64 * 2;
+     }
+     emitDeferredCycles += instructionCycles;
++    {
++      // Pipeline hazards against the next instruction and the FPU dependency stalls.
++      u32 nextInstruction = idx + 1 < plan.instructions.size() ? plan.instructions[idx + 1].instruction : 0;
++      emitDeferredCycles += self.hazardCycles(instruction, nextInstruction) * 2;
++      emitDeferredCycles += fpuStall[idx] * 2;
++      if(info.likelyBranch()) {  //a nullified delay slot still costs its cycle: state has EndBlock set only when not taken
++        mov32(reg(0), PipelineReg(state));
++        and32(reg(0), reg(0), imm(Pipeline::EndBlock));
++        shl64(reg(0), reg(0), imm(1));
++        add64(CpuClockMem, CpuClockMem, reg(0));
++      }
++    }
+     // Synchronize cycles before any branch/helper boundary.
+     if(delaySlot || info.branch() || emitCallfEmitted) flushDeferredCycles();
+ 
+@@ -769,8 +815,13 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+ 
+     if(slowPaths.size() != slowPathStart) {
+       // New slow paths created by this opcode resume right after it.
++      // The slow path charges the cycles deferred up to here itself, so settle them on the fast path before the
++      // resume label: otherwise an instruction that took the slow path was charged twice (uncached loads and
++      // cache misses cost one cycle more in the recompiler than in the interpreter).
++      u32 deferredAtResume = emitDeferredCycles;
++      flushDeferredCycles();
+       auto resume = sljit_emit_label(compiler);
+-      bindSlowPaths(slowPathStart, resume, emitDeferredCycles, !delaySlot);
++      bindSlowPaths(slowPathStart, resume, deferredAtResume, !delaySlot);
+     }
+ 
+     bool prevIsConditionalBranch = delaySlot && idx > 0
+diff --git a/ares/n64/memory/io.hpp b/ares/n64/memory/io.hpp
+index 5119ee9c..8d8a89ba 100644
+--- a/ares/n64/memory/io.hpp
++++ b/ares/n64/memory/io.hpp
+@@ -1,6 +1,6 @@
+ template<typename T>
+ struct RCP {  //A device which is part of RCP
+-  const u32 DefaultReadCycles = 20;
++  const u32 DefaultReadCycles = 22;  //an RCP register read stalls the CPU for 23 cycles in all (cpu_timing v14; MI: 11)
+   const u32 DefaultWriteCycles = 0;  //not implemented until we implement the CPU write queue
+ 
+   template<u32 Size>
+-- 
+2.43.0
+

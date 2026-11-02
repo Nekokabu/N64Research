@@ -1,0 +1,30 @@
+From c7fb6366916dbd7b817803366ffa3fa5f6ac4b53 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Tue, 27 Oct 2026 20:19:49 +0900
+Subject: [PATCH 01/12] n64: fix DPC_TMEM_BUSY register read
+
+RDP::readWord compared the data register instead of the address when decoding
+DPC_TMEM_BUSY (0x0410001c), so reads of the TMEM busy counter always returned 0.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/rdp/io.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ares/n64/rdp/io.cpp b/ares/n64/rdp/io.cpp
+index b7f3a9ba..549979a7 100644
+--- a/ares/n64/rdp/io.cpp
++++ b/ares/n64/rdp/io.cpp
+@@ -55,7 +55,7 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
+     if(&thread == &cpu) cpu.forceSynchronize();
+   }
+ 
+-  if(data == 7) {
++  if(address == 7) {
+     //DPC_TMEM_BUSY
+     data.bit(0,23) = command.tmemBusy;
+     if(&thread == &cpu) cpu.forceSynchronize();
+-- 
+2.43.0
+

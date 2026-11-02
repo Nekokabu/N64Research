@@ -1,0 +1,281 @@
+From 04ccd18d8fc2ebbc1d16cc3870b061951c19cd51 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 03:44:53 +0900
+Subject: [PATCH 04/12] n64: RDP timing: VI-mode factors, per-transfer bus
+ contention and span penalty from hardware
+
+The RDP model's corrections to the stacked-primitive tables were fitted to two scenes.
+Replaying the games' own display lists on an NTSC console (rdp_timing v9, v10, v12 and
+v15: twelve lists from Donkey Kong 64 and Beetle Adventure Racing dumped from ares and
+re-run from a test ROM, alone and beside controlled CPU and RSP traffic, under every VI
+mode, and with classes of commands removed) separates the three effects that the fixed
+factors lumped together:
+
+- Placement: the tables need 15 clocks more per read-modify-write span of a real list,
+  not 40 (the game lists are 0.84-0.88 of the console with no penalty and 0.95-1.07 with
+  15; the removed-command variants show the per-class shares within 3% of the console).
+- Other bus masters: instead of scaling every span by 13%/19%, each transfer of another
+  master now delays the RDP's queued work by what it costs on the console while the RDP
+  is drawing: a CPU data cache fill 11.7 clocks, an instruction cache fill 8.5, a
+  write-back 5, SP DMA 1.22 per 8 bytes (64 B: 10, 512 B: 77, 4 KiB: 656). The CPU side
+  of the same measurements (v10/v12): under a drawing RDP a data cache fill takes 5 cycles
+  longer, an instruction fill 6, a write-back 11.
+- The VI: the fixed 7% becomes the measured cost of the VI mode in use. The games' mode
+  (anti-aliasing always on, divot, dedither: three framebuffer lines fetched per output
+  line) slows every RDP transfer by 11.7% at 320x240 16-bit and 32% at 640 pixels; the
+  "resample" mode costs 3% whatever the width, "replicate" 0.4%. The CPU's transfers also
+  wait behind that fetch (6/6/2 cycles for fill/instruction fill/write-back), and the
+  per-transfer RDP losses above grow by the same factor (x1.25 in the games' mode).
+
+A dirty data cache miss on the console fills first and writes the evicted line back from
+the write buffer afterwards (a dirty miss costs 66 cycles against 41 for a clean one):
+the CPU is now charged 4 cycles for the write-back and the following line transfer waits
+until the bus is free, instead of 40 cycles up front.
+
+Donkey Kong 64's DKTV demo still completes; its frame deltas over the whole demo are the
+closest to the console so far (score 22 against 69 before). Beetle Adventure Racing's crash
+scene matches the console (68/74/66 VI per 30 frames against 70/76/69); the intro runs
+2.0 VI per frame where the console runs 2.5: both the CPU and the RDP sit within a few
+percent of the 2-VI boundary there, on both sides of it.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/cpu/cpu.cpp    | 21 ++++++++++++++++++---
+ ares/n64/cpu/cpu.hpp    | 28 ++++++++++++++++++++++------
+ ares/n64/cpu/dcache.cpp | 14 ++++++++++++--
+ ares/n64/rdp/rdp.hpp    | 23 +++++++++++++++++++----
+ ares/n64/rdp/timing.cpp | 34 +++++++++++++++++++++++++++++++---
+ 5 files changed, 102 insertions(+), 18 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index bacdae50..6c0a21b1 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -83,6 +83,7 @@ auto CPU::flushCount() -> void {
+ auto CPU::synchronize() -> void {
+   auto clocks = Thread::clock;
+   auto counted = countClock;
++  clockEpoch += clocks;
+   Thread::clock = 0;
+   countClock = 0;
+   jitClockTarget = 0;
+@@ -192,13 +193,27 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+   icache.line(vaddr).fill(paddr, *this);
+ }
+ 
+-auto CPU::rdpBusyStall(u32 cycles) -> u32 {
+-  return rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze ? cycles : 0;
++auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
++  u32 total = 0;
++  if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
++  if(rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze) {
++    rdp.timingDelay(rdpClocks * rdp.contendScale());  //and the RDP loses the bus for the transfer
++    total += cycles;
++  }
++  return total;
++}
++
++auto CPU::icacheBusyStall() -> u32 {
++  viStallCycles = ViStallIFill;
++  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI);
++  viStallCycles = ViStallFill;
++  return r;
+ }
+ 
+ //the recompiler's inline instruction cache fill: the stall part of the fill time
+ auto CPU::icacheStall() -> void {
+-  if(u32 cycles = rdpBusyStall(ICacheFillStall)) step(cycles * 2);
++  busWait();
++  if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI)) step(cycles * 2);
+ }
+ 
+ template<bool Recompiled>
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index f585846f..dc533cac 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -54,12 +54,27 @@ struct CPU : Thread {
+   auto raiseCoprocessor1Exception() -> void;
+   auto icacheFillLine(u64 vaddr, u32 paddr) -> void;
+ 
+-  //cache line transfers wait for RDRAM behind the RDP while it is drawing (measured on
+-  //hardware with rdp_timing v8: an instruction cache fill takes 10 CPU cycles longer, a
+-  //data cache fill 4, a data cache write-back 12; otherwise the CPU is not slowed down)
+-  auto rdpBusyStall(u32 cycles) -> u32;
++  //cache line transfers wait for RDRAM behind the RDP while it is drawing, and behind the VI's
++  //framebuffer fetch in the anti-aliased (divot/dedither) VI modes; measured on hardware with the
++  //rdp_timing test ROMs (v8/v10/v12): under a drawing RDP an instruction cache fill takes 6 CPU
++  //cycles longer, a data cache fill 5, a data cache write-back 11; in the games' VI mode another
++  //6/6/2. Each transfer in turn costs the RDP some clocks (rdp.timing.contendCpu*).
++  auto rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32;
+   auto icacheStall() -> void;
+-  enum : u32 { ICacheFillStall = 10, DCacheFillStall = 4, DCacheWriteBackStall = 12 };
++  auto icacheBusyStall() -> u32;
++  enum : u32 { ICacheFillStall = 6, DCacheFillStall = 5, DCacheWriteBackStall = 11 };
++  enum : u32 { ICacheFillCycles = 48, DCacheFillCycles = 40, DCacheWriteBackCycles = 25 };  //cpu_timing v14: fill 41 incl. the load, write-back 25
++  enum : u32 { ViStallFill = 6, ViStallIFill = 6, ViStallWriteBack = 2 };
++  u32 viStallCycles = ViStallFill;  //the VI part of the stall for the transfer in progress
++  //a dirty line is filled first and written back from the write buffer afterwards; the CPU pays
++  //'WriteBufferCycles' and the next line transfer waits until the bus is free again (v14: a dirty
++  //miss costs 66 cycles against 41 for a clean one)
++  enum : u32 { WriteBufferCycles = 4 };
++  s64 clockEpoch = 0;          //Thread::clock is reset at every synchronize(); epoch + clock is monotonic
++  s64 busFreeAt = 0;
++  bool wbPending = false;
++  auto busNow() const -> s64 { return clockEpoch + Thread::clock; }
++  auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); }
+ 
+   auto power(bool reset) -> void;
+ 
+@@ -213,7 +228,8 @@ struct CPU : Thread {
+       }
+ 
+       auto fill(u32 paddr, CPU& cpu) -> void {
+-        cpu.step((48 + cpu.rdpBusyStall(ICacheFillStall)) * 2);
++        cpu.busWait();
++        cpu.step((ICacheFillCycles + cpu.icacheBusyStall()) * 2);
+         const u32 tag = paddr & ~0x0000'0fffu;
+         tagKey = tag;
+         setValid(true);
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index 7f8ac0e1..ae205855 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -4,7 +4,15 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
+ }
+ 
+ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+-  cpu.step((40 + cpu.rdpBusyStall(DCacheFillStall)) * 2);
++  cpu.busWait();
++  cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu)) * 2);
++  if(cpu.wbPending) {
++    //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
++    cpu.wbPending = false;
++    cpu.viStallCycles = CPU::ViStallWriteBack;
++    cpu.busFreeAt = cpu.busNow() + (CPU::DCacheWriteBackCycles + cpu.rdpBusyStall(CPU::DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
++    cpu.viStallCycles = CPU::ViStallFill;
++  }
+   const u32 tag = paddr & ~0x0000'0fffu;
+   dirty  = 0;
+   tagKey = tag;
+@@ -13,7 +21,9 @@ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+ }
+ 
+ auto CPU::DataCache::Line::writeBack() -> void {
+-  cpu.step((40 + cpu.rdpBusyStall(DCacheWriteBackStall)) * 2);
++  if(cpu.wbPending) cpu.busWait();  //two evictions without a fill between them: the buffer holds one line
++  cpu.step(CPU::WriteBufferCycles * 2);
++  cpu.wbPending = true;
+   const u32 tag = tagKey & ~0x0000'0fffu;
+   cpu.busWriteBurst<DCache>(tag | index, words);
+ }
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 83df2c10..20aba09b 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -79,8 +79,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void;
+   auto timingMode() -> u32;
+   auto timingScale(bool memoryBound) -> f64;
++  auto viModeFactor() -> f64;
++  auto contendScale() -> f64;
+   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
+   auto timingAdd(f64 cycles) -> void;
++  auto timingDelay(f64 cycles) -> void;
+ 
+   //serialization.cpp
+   auto serialize(serializer&) -> void;
+@@ -91,10 +94,22 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   struct Timing {
+     //tunables
+     bool   enable = true;
+-    f64    contentionZ = 1.13;     //measured slowdown of read-modify-write spans (image read / depth) by the RDRAM traffic of a running game
+-    f64    contentionPlain = 1.19; //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
+-    f64    viFactor = 1.07;        //measured slowdown of read-modify-write spans with the VI scanning out a frame (write-only spans: none)
+-    f64    spanPenalty = 40.0;     //measured extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (scattered primitives: 35-50, triangle strips: 13-26)
++    //the other bus masters are charged as they happen (timingDelay) instead of a fixed factor
++    f64    contentionZ = 1.0;      //scale on read-modify-write spans (image read / depth) beyond the per-transfer charges below
++    f64    contentionPlain = 1.0;  //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
++    //the VI's framebuffer fetch slows every RDRAM transfer; measured by replaying game display lists under
++    //every VI mode on an NTSC console (rdp_timing v12/v15): AA mode 3 (replicate, one line fetched per
++    //output line) +0.4%, mode 2 (resample) +3%, modes 0/1 (anti-aliased with divot: three lines per output
++    //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
++    f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
++    f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
++    f64    viContendScale = 1.6;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*1.6 at 320x16 AA0 (v12: x1.25 at +15.5%)
++    //RDP clocks lost to each transfer of another bus master while it has work in flight (rdp_timing v10, RDP drawing a game list):
++    f64    contendCpu = 11.7;      //a CPU data cache line fill (16 bytes)
++    f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
++    f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
++    f64    contendDma = 1.22;      //per 8 bytes of SP DMA (64 B: 10, 512 B: 77, 4 KiB: 656)
++    f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
+     u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index ffec2adc..90d37a19 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -53,8 +53,11 @@ auto RDP::timingReset() -> void {
+   timing.enable = t.enable;
+   timing.contentionZ = t.contentionZ;
+   timing.contentionPlain = t.contentionPlain;
+-  timing.viFactor = t.viFactor;
+   timing.spanPenalty = t.spanPenalty;
++  timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW;
++  timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
++  timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
++  timing.contendDma = t.contendDma;
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto;
+   timing.colorSize = 2;
+@@ -75,6 +78,18 @@ auto RDP::timingAdd(f64 cycles) -> void {
+   timing.pending += work;
+ }
+ 
++//another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
++//everything queued, including the Sync_Full interrupts already waiting, completes that much later
++auto RDP::timingDelay(f64 cycles) -> void {
++  if(!timing.enable || cycles <= 0.0 || timing.pending == 0 || command.freeze) return;
++  timing.accumulated += cycles * 3.0;
++  u64 work = (u64)timing.accumulated;
++  timing.accumulated -= work;
++  timing.submitted += work;
++  timing.pending += work;
++  for(u32 n : range(timing.syncQueued)) timing.syncTargets[n] += work;
++}
++
+ //pick the table row for the current Set_Other_Modes / Set_Color_Image state
+ auto RDP::timingMode() -> u32 {
+   bool c32 = timing.colorSize == 3;
+@@ -115,11 +130,24 @@ auto RDP::timingMode() -> u32 {
+   return timing.mode = mode;
+ }
+ 
++//how much the VI's framebuffer fetch slows the RDP in the current VI mode (see rdp.hpp)
++auto RDP::viModeFactor() -> f64 {
++  if(!vi.active()) return 1.0;
++  f64 f = vi.io.antialias == 3 ? timing.viFactorAA3 : vi.io.antialias == 2 ? timing.viFactorAA2 : timing.viFactorAA0;
++  u32 bytes = ((u32)vi.io.width ? (u32)vi.io.width : 320u) * (vi.io.colorDepth == 3 ? 4u : 2u);
++  if(bytes > 640 && vi.io.antialias < 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScale * ((f64)bytes / 640.0 - 1.0));
++  return f;
++}
++
+ //what a span or load costs in a running game relative to the idle-console tables
+ auto RDP::timingScale(bool memoryBound) -> f64 {
+   f64 f = memoryBound ? timing.contentionZ : timing.contentionPlain;
+-  if(memoryBound && vi.active()) f *= timing.viFactor;
+-  return f;
++  return f * viModeFactor();
++}
++
++//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (v12: x1.25 in the AA modes)
++auto RDP::contendScale() -> f64 {
++  return 1.0 + (viModeFactor() - 1.0) * timing.viContendScale;
+ }
+ 
+ //cost of one span of 'pixels' pixels whose first pixel is at (x, y) of the color image
+-- 
+2.43.0
+

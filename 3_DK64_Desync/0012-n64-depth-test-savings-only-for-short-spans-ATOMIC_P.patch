@@ -1,0 +1,117 @@
+From e3c57e0a432bafefeee24494d5129c0547255546 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 1 Nov 2026 23:52:00 +0900
+Subject: [PATCH 12/12] n64: depth-test savings only for short spans,
+ ATOMIC_PRIM and 1-cycle anti-aliasing costs (rdp_timing v24/v25/v28)
+
+Replaying the games' frames on the console with the depth buffer preset so that
+only the frame's own overdraw fails costs exactly what the real frame costs: a
+span with one passing pixel pays the whole read-modify-write, and only spans
+hidden as a whole (short ones, Donkey Kong 64's small triangles: -17%) are
+cheaper. The estimated pass rate is therefore applied to spans of up to 16
+pixels only. ATOMIC_PRIM costs 20 clocks per primitive (DK64 -3.3% with the bit
+cleared), anti-aliasing 3.5 clocks per span in 1-cycle mode (DK64 -3.2%, none
+in 2-cycle mode).
+---
+ ares/n64/rdp/rdp.hpp           |  5 +++++
+ ares/n64/rdp/serialization.cpp |  2 ++
+ ares/n64/rdp/timing.cpp        | 21 ++++++++++++++++++---
+ 3 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index aeac4d87..6c8588d5 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -119,6 +119,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
++    u32    zFailWidth = 16;        //spans up to this many pixels can fail the depth test as a whole; wider spans always pay the passing cost (rdp_timing v24/v28)
++    f64    atomicCost = 20.0;      //clocks per primitive with ATOMIC_PRIM set (rdp_timing v24/v25)
++    f64    aaSpanCost = 3.5;       //clocks per span of an anti-aliased 1-cycle primitive (rdp_timing v24)
++    n1     atomicPrim;             //Set_Other_Modes bits the model needs beyond the cycle type and depth/image read
++    n1     antialias;
+     u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
+ 
+     //state decoded from the command stream (only what the model needs)
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index 41c9d9f4..88678057 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -37,6 +37,8 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.accumulated);
+   s(timing.zPassFraction);
+   s(timing.frameZPixels);
++  s(timing.atomicPrim);
++  s(timing.antialias);
+   s(timing.submitted);
+   s(timing.completed);
+   s(timing.pending);
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index f6846f62..00a16169 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -59,7 +59,8 @@ auto RDP::timingReset() -> void {
+   timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
+   timing.contendDma = t.contendDma; timing.contendDmaBase = t.contendDmaBase;
+   timing.zPassFraction = t.zPassFraction;
+-  timing.zPassAuto = t.zPassAuto;
++  timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
++  timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
+   timing.colorSize = 2;
+   timing.colorWidth = 319;
+   timing.textureSize = 2;
+@@ -181,7 +182,13 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+     f64 fail = rdp_tm_span(zfail, address, w);
+     timing.frameZPixels += pixels;
+     if(both) {
+-      cost += (fail - pass) * (1.0 - timing.zPassFraction);
++      //a span whose pixels all fail the depth test is 15-40 clocks cheaper (no writes), but a span
++      //with even one passing pixel costs the full read-modify-write: the games' frames replayed with
++      //the depth buffer preset so that only their own overdraw fails cost exactly what the real frames
++      //cost (rdp_timing v24), so partial occlusion saves nothing. Only short spans are hidden as a
++      //whole (Donkey Kong 64's small triangles: -17% on the console, v28), so the estimated pass rate
++      //is applied to spans up to zFailWidth pixels and wider spans always pay the passing cost.
++      if(w <= (s32)timing.zFailWidth) cost += (fail - pass) * (1.0 - timing.zPassFraction);
+     } else {
+       auto partial = timing.zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD;
+       f64 ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
+@@ -222,7 +229,7 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+   if(rowEnd - rowStart > 1024) rowEnd = rowStart + 1024;  //guard against garbage
+ 
+   f64 cycles = 0.0;
+-  u32 widest = 0;
++  u32 widest = 0, spans = 0;
+   for(s32 row = rowStart; row < rowEnd; row++) {
+     f64 yc = row + 0.5;
+     if(yc < fyh || yc >= fyl) continue;
+@@ -236,11 +243,17 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     u32 pixels = (u32)(x1 - x0 + 0.5);
+     if(pixels == 0) pixels = 1;
+     if(pixels > widest) widest = pixels;
++    spans++;
+     cycles += timingSpan((s32)floor(x0), row, pixels);
+   }
+   //per-primitive overhead (can be slightly negative: setup overlaps the previous primitive)
+   cycles += rdp_tm_prim_overhead((enum rdp_tm_mode)timing.mode, widest ? widest : 1);
+   if(shade || texture) cycles += 3.0;
++  //ATOMIC_PRIM serialises the primitives: 20 clocks each (Donkey Kong 64 sets it; rdp_timing v24/v25:
++  //-3.3% / -1.5..1.9% of its frames with the bit cleared). Anti-aliasing costs about 3.5 clocks per
++  //span in 1-cycle mode (DK64 -3.2%) and nothing in 2-cycle mode (Beetle Adventure Racing: 0).
++  if(timing.atomicPrim) cycles += timing.atomicCost;
++  if(timing.antialias && timing.cycleType == 0) cycles += timing.aaSpanCost * (f64)spans;
+   timingAdd(cycles);
+ }
+ 
+@@ -367,6 +380,8 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+     timing.imageRead = n1(op >>  6);
+     timing.zUpdate   = n1(op >>  5);
+     timing.zCompare  = n1(op >>  4);
++    timing.atomicPrim = n1(op >> 55);
++    timing.antialias  = n1(op >>  3);
+     timingMode();
+     timingAdd(state);
+   } break;
+-- 
+2.43.0
+

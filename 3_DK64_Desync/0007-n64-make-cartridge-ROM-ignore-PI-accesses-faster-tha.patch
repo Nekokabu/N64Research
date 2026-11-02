@@ -1,0 +1,111 @@
+From 0ee7d240cb1b3a2ec89d7d9f3d358d8f9a5f0582 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Mon, 12 Oct 2026 00:48:19 +0900
+Subject: [PATCH 07/12] n64: make cartridge ROM ignore PI accesses faster than
+ a mask ROM can serve
+
+The PI bus timing registers (PI_BSD_DOM1_LAT/PWD) were accepted
+unconditionally: a cartridge ROM read returned correct data no matter
+how short the latency and /RD pulse were. On real hardware the mask ROMs
+used in cartridges (and the SDRAM/FPGA paths of flashcarts) need a
+minimum address access time (tAA ~ 100ns) and output enable time
+(tOE ~ 50ns); below that the PI samples the bus before the ROM has
+driven it and reads back garbage.
+
+"MGC 2011 Demo" by Retroactive relies on this to detect emulators: it
+saves the IPL2-configured timings, programs LAT=2 PWD=2 PGS=0xF RLS=2
+(48ns + 48ns), reads the ROM header at 0xB0000000 and, if it gets the
+correct 0x80371240 back, sets a flag that makes the demo show "FAIL."
+instead of running.
+
+Add accessCycles()/pulseCycles() helpers to PIDeviceTiming, and have
+Cartridge::RomDevice::piAddress() refuse to answer when
+(LAT+1)+(PWD+1) < 7 cycles (~112ns) or (PWD+1) < 4 cycles (~64ns),
+so that the existing PI open bus behaviour applies. The thresholds keep
+every known legitimate configuration working: retail headers
+(LAT=0x40 PWD=0x12), the 64DD IPL ROM (PWD=0x07) and the flashcart
+settings used by libcart (LAT=4..5 PWD=0x0C), while rejecting the demo's
+LAT=2 PWD=2 probe. An [unusual] debug message is logged when a read is
+rejected.
+
+Verified with a headless run of the ROM: before the change the fail flag
+at 0x8001F8D0 is set and "FAIL." is drawn; after it the flag stays clear
+and the demo plays through its scenes.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01XM2ynbCHjj8s9JtNp3P6Zx
+---
+ ares/n64/cartridge/cartridge.hpp | 29 ++++++++++++++++++++++++++++-
+ ares/n64/pi/device.hpp           | 14 ++++++++++++++
+ 2 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/ares/n64/cartridge/cartridge.hpp b/ares/n64/cartridge/cartridge.hpp
+index b3cbc282..cc24e6ed 100644
+--- a/ares/n64/cartridge/cartridge.hpp
++++ b/ares/n64/cartridge/cartridge.hpp
+@@ -7,9 +7,36 @@ struct Cartridge {
+   struct RomDevice : PIDeviceMemory {
+     Cartridge& self;
+     RomDevice(Cartridge& self) : self(self) {}
+-    auto piAddress(u32 address, PIDeviceTiming timing) -> bool override {
++
++    //The mask ROMs used in cartridges cannot keep up with arbitrarily fast PI bus timings.
++    //Period 16-bit mask ROMs (eg Macronix MX23C/MX23L) specify an address access time (tAA)
++    //of ~100ns and an output enable time (tOE) of ~50ns. If the PI samples the bus before
++    //the ROM has had time to drive it, real hardware reads back garbage (open bus), and
++    //the ROM must not answer. Reference points, in (LAT, PWD) form:
++    //  retail cartridges (header 80 37 12 40):   (0x40, 0x12) => 1040ns + 304ns
++    //  64DD IPL ROM (header 80 27 07 40):        (0x40, 0x07) => 1040ns + 128ns
++    //  flashcarts (libcart: EverDrive, 64drive): (0x04, 0x0c) => 80ns + 208ns
++    //  MGC 2011 Demo (Retroactive) emulator test: (0x02, 0x02) => 48ns + 48ns
++    //The last one deliberately reads the ROM header with timings no cartridge can satisfy
++    //and refuses to run ("FAIL.") if the correct data comes back, as it only can on an
++    //emulator that ignores the timing registers.
++    static constexpr u32 minAccessCycles = 7;  //(LAT+1)+(PWD+1) >= 112ns  (tAA ~ 100ns)
++    static constexpr u32 minPulseCycles  = 4;  //(PWD+1)         >=  64ns  (tOE ~  50ns)
++
++    auto piTimingSatisfied(const PIDeviceTiming& timing) const -> bool {
+       if(!timing.fasterThan(min)) return false;
++      if(timing.accessCycles() < minAccessCycles) return false;
++      if(timing.pulseCycles()  < minPulseCycles ) return false;
++      return true;
++    }
++
++    auto piAddress(u32 address, PIDeviceTiming timing) -> bool override {
+       if(address < 0x1000'0000 || address >= 0x1000'0000 + self.rom.size) return false;
++      if(!piTimingSatisfied(timing)) {
++        debug(unusual, "[Cartridge::RomDevice::piAddress] PI timings too fast for mask ROM (LAT=",
++          hex(timing.latency, 2L), " PWD=", hex(timing.pulseWidth, 2L), "); reading open bus");
++        return false;
++      }
+       piView = {self.rom.data, self.rom.size};
+       piViewOffset = address - 0x1000'0000;
+       piViewWritable = false;
+diff --git a/ares/n64/pi/device.hpp b/ares/n64/pi/device.hpp
+index e2acc9e3..c2b8c9e2 100644
+--- a/ares/n64/pi/device.hpp
++++ b/ares/n64/pi/device.hpp
+@@ -8,6 +8,20 @@ struct PIDeviceTiming {
+         && pulseWidth      >= other.pulseWidth
+         && releaseDuration >= other.releaseDuration;
+   }
++
++  //Each PI bus cycle is one RCP clock (~16ns @ 62.5MHz).
++  //The PI latches the address on /ALE_L, waits (LAT+1) cycles, then holds /RD (or /WR)
++  //low for (PWD+1) cycles and samples the data bus on its rising edge.
++
++  //time the device has from the address being latched until the first word is sampled
++  auto accessCycles() const -> u32 {
++    return (latency + 1) + (pulseWidth + 1);
++  }
++
++  //time the device has to drive the bus while /RD is asserted
++  auto pulseCycles() const -> u32 {
++    return pulseWidth + 1;
++  }
+ };
+ 
+ struct PIDevice {
+-- 
+2.43.0
+

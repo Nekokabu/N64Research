@@ -1,0 +1,343 @@
+From bc6fbd9a894e092d1c57811e6feb8b89b061ebc1 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 08:26:33 +0900
+Subject: [PATCH 08/12] n64: CPU write buffer, FPU operand costs and cache-op
+ timing from hardware (cpu_timing v18, rdp_timing v17)
+
+cpu_timing v18 measured what v14 could not separate:
+
+- FPU: the costs v11/v14 saw (add/sub/mul issuing in 2 cycles, div.d 30) were the
+  hardware's fast paths for trivial operands (adding 0.0, multiplying by 0.0, 1.0 or a
+  power of two, dividing 0.0). With ordinary operands add/sub take 3 cycles, mul.s 5,
+  mul.d 8, div.s and sqrt.s 29, div.d and sqrt.d 58, conversions 5, compares 1, and a
+  dependent instruction waits one more cycle. Use those; the fast paths are not modelled.
+- Write buffer: stores that leave the CPU (uncached RDRAM, RCP registers, dirty lines) go
+  through a 4-entry buffer and drain in order, an uncached word occupying the bus for 16
+  cycles, an SP/DP register write 10, an MI register write 2. The CPU only waits when the
+  buffer is full, when a line fill or an uncached read needs the bus (a fill also pays the
+  9-cycle bus turnaround after a write: +25 behind one posted word), or when a store
+  follows a dirty-line write-back that has not left yet. A dirty victim's write-back is
+  mostly hidden behind the following instructions (+6 when the next miss is 32 cycles
+  away, +28 when it follows at once); it was charged as 25 serial cycles.
+- A cache operation costs 5 cycles; the line it writes back leaves through the buffer.
+
+rdp_timing v17 replayed the game display lists beside combined CPU/RSP loads: the losses
+add up (no super-additive term), a CPU write-back costs the RDP about 1 clock instead of
+5, and each uncached CPU write costs it about 4 (2.7 with the VI off, 5 in the games' VI
+mode), which was not modelled.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/cpu/cpu.cpp             | 38 ++++++++++++++++++++++++---
+ ares/n64/cpu/cpu.hpp             | 44 ++++++++++++++++++++++----------
+ ares/n64/cpu/dcache.cpp          | 11 +++-----
+ ares/n64/cpu/interpreter-ipu.cpp |  4 +++
+ ares/n64/cpu/memory.cpp          |  2 ++
+ ares/n64/cpu/recompiler-fpu.cpp  | 16 ++++++------
+ ares/n64/cpu/recompiler.cpp      |  2 +-
+ ares/n64/rdp/rdp.hpp             |  3 ++-
+ ares/n64/rdp/timing.cpp          |  2 +-
+ 9 files changed, 86 insertions(+), 36 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index d1ad3bdd..d41057c0 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -209,9 +209,10 @@ auto CPU::fpuLatency(u32 instruction) const -> u32 {
+   u32 fmt = instruction >> 21 & 31, fn = instruction & 0x3f;
+   bool dbl = fmt == 17 || fmt == 21;
+   switch(fn) {
+-  case 0x00: case 0x01: case 0x02: return 3;          //add, sub, mul
+-  case 0x03: return dbl ? 30 : 29;                    //div (div.s measured 28-29; div.d assumed like sqrt.d)
+-  case 0x04: return dbl ? 30 : 29;                    //sqrt (measured 28-29 and 30)
++  case 0x00: case 0x01: return 4;                     //add, sub: issue 3, a dependent instruction waits 1 more (v18)
++  case 0x02: return dbl ? 9 : 6;                      //mul.s 5 / mul.d 8, +1 dependent (v18; 2 with a 0.0 / 1.0 / power-of-two operand)
++  case 0x03: return dbl ? 59 : 30;                    //div.s 29 / div.d 58, +1 dependent (v18; 2 with a 0.0 dividend)
++  case 0x04: return dbl ? 59 : 30;                    //sqrt.s 29 / sqrt.d 58 (v18; 2 for sqrt(0.0))
+   case 0x05: case 0x06: case 0x07: return 1;          //abs, mov, neg
+   case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: return 5;  //round/trunc/ceil/floor
+   case 0x20: case 0x21: case 0x24: case 0x25: return 5;  //cvt
+@@ -254,9 +255,38 @@ auto CPU::icacheBusyStall() -> u32 {
+   return r;
+ }
+ 
++//a dirty line leaves the write buffer: the bus is busy for the 16-byte write (the CPU itself paid
++//WriteBufferCycles when the line was evicted)
++auto CPU::postWriteBack() -> void {
++  wbPending = false;
++  viStallCycles = ViStallWriteBack;
++  s64 now = busNow();
++  busFreeAt = (busFreeAt > now ? busFreeAt : now) + (DCacheWriteBackCycles + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
++  viStallCycles = ViStallFill;
++}
++
++//an uncached RDRAM or RCP register store enters the write buffer (cpu_timing v18)
++auto CPU::postWrite(u32 paddr) -> void {
++  s64 now = busNow();
++  if(wbPending) { busWait(); postWriteBack(); busWait(); now = busNow(); }   //the pending write-back drains first
++  while(wbCount && wbDone[wbHead] <= now) { wbHead = wbHead + 1 & 3; wbCount--; }
++  if(wbCount >= WriteBufferEntries) {                                        //full: wait for the oldest entry
++    step((u32)(wbDone[wbHead] - now)); now = busNow();
++    wbHead = wbHead + 1 & 3; wbCount--;
++  }
++  u32 cycles;
++  if(paddr < 0x03f0'0000) cycles = UncachedWriteCycles + rdpBusyStall(UncachedWriteStall, rdp.timing.contendCpuU);
++  else if((paddr & 0xfff0'0000) == 0x0430'0000) cycles = MiWriteCycles;
++  else cycles = RcpWriteCycles;
++  s64 start = busFreeAt > now ? busFreeAt : now;
++  s64 done = start + cycles * 2;
++  wbDone[wbHead + wbCount & 3] = done; wbCount++;
++  busFreeAt = done;
++}
++
+ //the recompiler's inline instruction cache fill: the stall part of the fill time
+ auto CPU::icacheStall() -> void {
+-  busWait();
++  busWaitFill();
+   if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI)) step(cycles * 2);
+ }
+ 
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index 9d801d1b..22d7a0e4 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -66,22 +66,40 @@ struct CPU : Thread {
+   enum : u32 { ICacheFillCycles = 48, DCacheFillCycles = 40, DCacheWriteBackCycles = 25 };  //cpu_timing v14: fill 41 incl. the load, write-back 25
+   enum : u32 { ViStallFill = 6, ViStallIFill = 6, ViStallWriteBack = 2 };
+   u32 viStallCycles = ViStallFill;  //the VI part of the stall for the transfer in progress
+-  //a dirty line is filled first and written back from the write buffer afterwards; the CPU pays
+-  //'WriteBufferCycles' and the next line transfer waits until the bus is free again (v14: a dirty
+-  //miss costs 66 cycles against 41 for a clean one)
+-  enum : u32 { WriteBufferCycles = 4 };
++  //The write buffer (cpu_timing v14/v18). Stores that leave the CPU (uncached RDRAM, RCP registers,
++  //dirty cache lines) are posted to a 4-entry buffer and drained in order: an uncached RDRAM word
++  //occupies the bus for 16 cycles (a 16-byte line 17), an SP/DP register write 10, an MI register 2.
++  //The CPU only waits when the buffer is full (the 5th store of a burst), when a line fill or an
++  //uncached read needs the bus (they wait for everything posted before them; a fill that follows a
++  //write also pays the 9-cycle turnaround of the RDRAM bus), and when a store follows a dirty-line
++  //write-back that has not left yet. A dirty line is filled first and written back afterwards; the
++  //CPU pays 'WriteBufferCycles' for that (v14: a dirty miss costs 66 cycles against 41 for a clean
++  //one when the next fill follows at once, 6 more than a clean one when it comes 32 cycles later).
++  enum : u32 { WriteBufferCycles = 6, WriteBufferEntries = 4 };
++  enum : u32 { UncachedWriteCycles = 16, RcpWriteCycles = 10, MiWriteCycles = 2, BusTurnaroundCycles = 9 };
++  enum : u32 { UncachedWriteStall = 15 };  //while the RDP draws (rdp_timing v17: 33 cycles per uncached write)
+   s64 clockEpoch = 0;          //Thread::clock is reset at every synchronize(); epoch + clock is monotonic
+-  s64 busFreeAt = 0;
+-  bool wbPending = false;
++  s64 busFreeAt = 0;           //when the last posted write leaves the bus
++  s64 wbDone[WriteBufferEntries] = {}; u32 wbHead = 0, wbCount = 0;
++  bool wbPending = false;      //a dirty line waits to be written back after the fill that evicted it
+   auto busNow() const -> s64 { return clockEpoch + Thread::clock; }
+-  auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); }
++  auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); wbCount = 0; }
++  auto busWaitFill() -> void {
++    s64 now = busNow(), until = busFreeAt + BusTurnaroundCycles * 2;
++    if(busFreeAt > now - BusTurnaroundCycles * 2 && until > now) step((u32)(until - now));
++    wbCount = 0;
++  }
++  auto postWrite(u32 paddr) -> void;
++  auto postWriteBack() -> void;
+   //an uncached RDRAM read stalls the pipeline for 32 cycles in all (cpu_timing v14; nemu64-test agrees)
+   enum : u32 { UncachedReadCycles = 31 };
+-  //FPU costs measured with cpu_timing v11/v14: the FPU is pipelined. add/sub/mul (single and double)
+-  //issue in 2 cycles and their result is ready 3 cycles after issue; conversions take 5; div.s and
+-  //sqrt.s 29, the double forms 30; compares 1. 'issue' is what the instruction itself costs, the
+-  //dependency stalls are scheduled per block by the recompiler (fpuLatency) and are not charged by
+-  //the interpreter.
++  //FPU costs measured with cpu_timing v11/v14/v18. With ordinary operands add/sub (single and
++  //double) issue in 3 cycles, mul.s in 5, mul.d in 8, div.s and sqrt.s in 29, div.d and sqrt.d in
++  //58, conversions in 5, compares in 1; a dependent instruction waits one more cycle (v18). The
++  //hardware has fast paths for trivial operands (adding 0.0, multiplying by 0.0, 1.0 or a power of
++  //two, dividing 0.0, sqrt(0.0): 2 cycles) that are not modelled. 'issue' is what the instruction
++  //itself costs, the dependency stalls are scheduled per block by the recompiler (fpuLatency) and
++  //are not charged by the interpreter.
+   auto fpuCycles(u32 issue) const -> u32 { return (issue - 1) * 2; }
+   auto fpuLatency(u32 instruction) const -> u32;
+   //pipeline hazards measured with cpu_timing v11/v14: a load followed by an instruction that uses
+@@ -242,7 +260,7 @@ struct CPU : Thread {
+       }
+ 
+       auto fill(u32 paddr, CPU& cpu) -> void {
+-        cpu.busWait();
++        cpu.busWaitFill();
+         cpu.step((ICacheFillCycles + cpu.icacheBusyStall()) * 2);
+         const u32 tag = paddr & ~0x0000'0fffu;
+         tagKey = tag;
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index a39b6a6d..bd552f9d 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -4,15 +4,10 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
+ }
+ 
+ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+-  cpu.busWait();
++  cpu.busWaitFill();
+   cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu)) * 2);
+-  if(cpu.wbPending) {
+-    //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
+-    cpu.wbPending = false;
+-    cpu.viStallCycles = CPU::ViStallWriteBack;
+-    cpu.busFreeAt = cpu.busNow() + (CPU::DCacheWriteBackCycles + cpu.rdpBusyStall(CPU::DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
+-    cpu.viStallCycles = CPU::ViStallFill;
+-  }
++  //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
++  if(cpu.wbPending) cpu.postWriteBack();
+   const u32 tag = paddr & ~0x0000'0fffu;
+   dirty  = 0;
+   tagKey = tag;
+diff --git a/ares/n64/cpu/interpreter-ipu.cpp b/ares/n64/cpu/interpreter-ipu.cpp
+index 938ccbd0..4702eaa4 100644
+--- a/ares/n64/cpu/interpreter-ipu.cpp
++++ b/ares/n64/cpu/interpreter-ipu.cpp
+@@ -242,6 +242,10 @@ auto CPU::CACHE(u8 operation, cr64& rs, s16 imm) -> void {
+   }
+ 
+   }
++  //a cache operation costs 5 cycles (cpu_timing v18); a dirty line it wrote back leaves through the
++  //write buffer once the bus is free
++  step(3 * 2);
++  if(wbPending) { busWait(); postWriteBack(); }
+ }
+ 
+ auto CPU::DADD(r64& rd, cr64& rs, cr64& rt) -> void {
+diff --git a/ares/n64/cpu/memory.cpp b/ares/n64/cpu/memory.cpp
+index b84e811c..12635f7b 100644
+--- a/ares/n64/cpu/memory.cpp
++++ b/ares/n64/cpu/memory.cpp
+@@ -170,6 +170,7 @@ auto CPU::read(PhysAccess access) -> maybe<u64> {
+   u32 paddr = access.paddr;
+   if(context.littleEndian()) paddr = reverseEndianPaddr<Size>(paddr);
+   if(access.cache) return dcache.read<Size>(access.vaddr, paddr);
++  busWait();  //a read waits for the writes posted before it (v14/v18)
+   if(paddr < 0x03f0'0000) step(UncachedReadCycles * 2);  //RDRAM: the RCP devices charge their own cost
+   return busRead<Size>(paddr);
+ }
+@@ -191,6 +192,7 @@ auto CPU::write(PhysAccess access, u64 data) -> bool {
+   u32 paddr = access.paddr;
+   if(context.littleEndian()) paddr = reverseEndianPaddr<Size>(paddr);
+   if(access.cache) return dcache.write<Size>(access.vaddr, paddr, data), true;
++  postWrite(paddr);  //the write buffer (v18)
+   return busWrite<Size>(paddr, data), true;
+ }
+ 
+diff --git a/ares/n64/cpu/recompiler-fpu.cpp b/ares/n64/cpu/recompiler-fpu.cpp
+index ffd72d61..76a1f634 100644
+--- a/ares/n64/cpu/recompiler-fpu.cpp
++++ b/ares/n64/cpu/recompiler-fpu.cpp
+@@ -1072,7 +1072,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FADD_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(3),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1089,7 +1089,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSUB_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(3),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1106,7 +1106,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FMUL_S, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth32, self.fpuCycles(5),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1595,7 +1595,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FADD_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(3),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1612,7 +1612,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSUB_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(3),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1629,7 +1629,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FMUL_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(2),
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(8),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1646,7 +1646,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FDIV_D, imm(Fdn), imm(Fsn), imm(Ftn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(30),
++      Fdn, {Fsn, Ftn}, FpuWidth64, self.fpuCycles(58),
+       FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+@@ -1663,7 +1663,7 @@ auto CPU::Recompiler::emitFPU(u32 instruction, EmitPcMode pcMode) -> EmitExecute
+         callf(&CPU::FSQRT_D, imm(Fdn), imm(Fsn));
+         return EmitExecuteResult::MayFault;
+       },
+-      Fdn, {Fsn}, FpuWidth64, self.fpuCycles(30), FpuCheckSnan,
++      Fdn, {Fsn}, FpuWidth64, self.fpuCycles(58), FpuCheckSnan,
+       fpuDiv0Mask | fpuOverflowMask | fpuUnderflowMask | fpuInexactMask,
+       [&]() -> void {
+         fsqrt64_f0();
+diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
+index 498b5ab0..632e64e7 100644
+--- a/ares/n64/cpu/recompiler.cpp
++++ b/ares/n64/cpu/recompiler.cpp
+@@ -694,7 +694,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+         if(fn <= 0x03 || fn >= 0x30) need = max(need, ready[ft]);
+         s64 stall = max<s64>(0, need - t);
+         fpuStall[i] = (u32)stall; t += stall;
+-        u32 issue = lat <= 3 ? 2 : lat;   //add/sub/mul issue 2; conversions (5) and div/sqrt are not pipelined
++        u32 issue = lat == 4 ? 3 : lat >= 6 ? lat - 1 : lat;   //add/sub 3, mul 5/8, div and sqrt 29/58, conversions 5, moves 1 (fpuLatency is one more where a dependent instruction waits)
+         if(fn < 0x30) ready[fd] = t + lat;
+         t += issue;
+       } else if(op == 0x31 || op == 0x35) {  //LWC1/LDC1
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 20aba09b..a81acac1 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -107,7 +107,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //RDP clocks lost to each transfer of another bus master while it has work in flight (rdp_timing v10, RDP drawing a game list):
+     f64    contendCpu = 11.7;      //a CPU data cache line fill (16 bytes)
+     f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
+-    f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
++    f64    contendCpuW = 1.0;      //a CPU data cache write-back (16 bytes; rdp_timing v17: a random load+store loop costs the RDP about two fills' worth, not two fills and two write-backs)
++    f64    contendCpuU = 4.0;      //an uncached CPU write (rdp_timing v17: 2.7 with the VI off, 5 in the games' VI mode)
+     f64    contendDma = 1.22;      //per 8 bytes of SP DMA (64 B: 10, 512 B: 77, 4 KiB: 656)
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 90d37a19..5507babf 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -54,7 +54,7 @@ auto RDP::timingReset() -> void {
+   timing.contentionZ = t.contentionZ;
+   timing.contentionPlain = t.contentionPlain;
+   timing.spanPenalty = t.spanPenalty;
+-  timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW;
++  timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+   timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
+   timing.contendDma = t.contendDma;
+-- 
+2.43.0
+

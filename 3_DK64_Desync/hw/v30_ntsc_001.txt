@@ -1,0 +1,154 @@
+# rdp_timing v25 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E1A00; dma buffer at 0x7D0000; heap top 0x0E4000; display buffer at 0x04B280; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	124
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	mgc_p4_3794.bin	list 299872 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_3794.bin	full	vi_off	1415794	1061842	1256973	0	640	93021
+X	mgc_p4_3794.bin	full	game	1466052	1099474	1256973	3242	1280	93774
+X	mgc_p4_3794.bin	tri_only	vi_off	1310996	983185	1256973	0	640	93023
+X	mgc_p4_3794.bin	tri_only	game	1356802	1017597	1256973	3242	1280	94221
+X	mgc_p4_3794.bin	om_no_tlut	vi_off	1415470	1061598	1256973	0	640	92998
+X	mgc_p4_3794.bin	om_no_tlut	game	1465908	1099366	1256973	3242	1280	93873
+X	mgc_p4_3794.bin	om_tlut_on	vi_off	1415444	1061521	1256973	0	640	93021
+X	mgc_p4_3794.bin	om_no_dither	vi_off	1415446	1061581	1256973	0	640	92986
+X	mgc_p4_3794.bin	om_point	vi_off	1415516	1061575	1256973	0	640	93029
+X	mgc_p4_3794.bin	om_no_bilerp	vi_off	1415434	1061571	1256973	0	640	92998
+X	mgc_p4_3794.bin	om_no_persp	vi_off	1415480	1061548	1256973	0	640	93033
+X	mgc_p4_3794.bin	om_no_key	vi_off	1415924	1061881	1256973	0	640	93037
+X	mgc_p4_3794.bin	om_no_fblend	vi_off	1415600	1061638	1256973	0	640	93004
+X	mgc_p4_3794.bin	om_no_cvg	vi_off	1415602	1061697	1256973	0	640	93020
+X	mgc_p4_3794.bin	om_2cyc	vi_off	1851118	1388335	1256973	0	640	93031
+X	mgc_p4_3794.bin	tri_flat	vi_off	1415948	1061899	1256973	0	640	93039
+X	mgc_p4_3794.bin	tri_noshade	vi_off	1425070	1068799	1256973	0	640	93022
+X	mgc_p4_3794.bin	tri_notex	vi_off	1424842	1068627	1256973	0	640	93020
+X	mgc_p4_3794.bin	tri_edge	vi_off	1446586	1084936	1256973	0	640	93006
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1410922	1058187	1181238	0	640	93034
+X	mgc_p4_4316.bin	full	game	1411028	1058267	1181238	3242	1280	93034
+X	mgc_p4_4316.bin	tri_only	vi_off	1306090	979563	1181238	0	640	93045
+X	mgc_p4_4316.bin	tri_only	game	1306078	979554	1181238	3242	1280	93040
+X	mgc_p4_4316.bin	om_no_tlut	vi_off	1410910	1058179	1181238	0	640	93048
+X	mgc_p4_4316.bin	om_no_tlut	game	1410838	1058124	1181238	3242	1280	93029
+X	mgc_p4_4316.bin	om_tlut_on	vi_off	1410826	1058115	1181238	0	640	93059
+X	mgc_p4_4316.bin	om_no_dither	vi_off	1411114	1058331	1181238	0	640	93010
+X	mgc_p4_4316.bin	om_point	vi_off	1411040	1058218	1181238	0	640	93070
+X	mgc_p4_4316.bin	om_no_bilerp	vi_off	1411210	1058403	1181238	0	640	93011
+X	mgc_p4_4316.bin	om_no_persp	vi_off	1410826	1058115	1181238	0	640	93059
+X	mgc_p4_4316.bin	om_no_key	vi_off	1410826	1058116	1181238	0	640	93047
+X	mgc_p4_4316.bin	om_no_fblend	vi_off	1411210	1058404	1181238	0	640	93030
+X	mgc_p4_4316.bin	om_no_cvg	vi_off	1410910	1058178	1181238	0	640	93060
+X	mgc_p4_4316.bin	om_2cyc	vi_off	1871662	1403743	1181238	0	640	93053
+X	mgc_p4_4316.bin	tri_flat	vi_off	1410910	1058179	1181238	0	640	93037
+X	mgc_p4_4316.bin	tri_noshade	vi_off	1419668	1064689	1181238	0	640	92994
+X	mgc_p4_4316.bin	tri_notex	vi_off	1420016	1064950	1181238	0	640	92994
+X	mgc_p4_4316.bin	tri_edge	vi_off	1442914	1082181	1181238	0	640	92998
+XI	mgc_p4_4544.bin	list 205472 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4544.bin	full	vi_off	1492594	1119442	1352134	0	640	92991
+X	mgc_p4_4544.bin	full	game	1492618	1119460	1352134	3242	1280	93040
+X	mgc_p4_4544.bin	tri_only	vi_off	1387798	1040844	1352134	0	640	93028
+X	mgc_p4_4544.bin	tri_only	game	1387882	1040907	1352134	3242	1280	93064
+X	mgc_p4_4544.bin	om_no_tlut	vi_off	1492522	1119387	1352134	0	640	93035
+X	mgc_p4_4544.bin	om_no_tlut	game	1492234	1119171	1352134	3242	1280	93064
+X	mgc_p4_4544.bin	om_tlut_on	vi_off	1492606	1119451	1352134	0	640	93015
+X	mgc_p4_4544.bin	om_no_dither	vi_off	1492234	1119171	1352134	0	640	93064
+X	mgc_p4_4544.bin	om_point	vi_off	1492438	1119324	1352134	0	640	93048
+X	mgc_p4_4544.bin	om_no_bilerp	vi_off	1492726	1119541	1352134	0	640	93030
+X	mgc_p4_4544.bin	om_no_persp	vi_off	1492414	1119306	1352134	0	640	93016
+X	mgc_p4_4544.bin	om_no_key	vi_off	1492414	1119306	1352134	0	640	93013
+X	mgc_p4_4544.bin	om_no_fblend	vi_off	1492726	1119540	1352134	0	640	93029
+X	mgc_p4_4544.bin	om_no_cvg	vi_off	1492462	1119342	1352134	0	640	93040
+X	mgc_p4_4544.bin	om_2cyc	vi_off	2082826	1562056	1352134	0	640	93014
+X	mgc_p4_4544.bin	tri_flat	vi_off	1492606	1119450	1352134	0	640	93035
+X	mgc_p4_4544.bin	tri_noshade	vi_off	1499146	1124355	1352134	0	640	93021
+X	mgc_p4_4544.bin	tri_notex	vi_off	1499242	1124428	1352134	0	640	93048
+X	mgc_p4_4544.bin	tri_edge	vi_off	1513234	1134921	1352134	0	640	92998
+XI	mgc_p1_0152.bin	list 93568 B, prefix 10, z 46A000+524800, regions 1D3B70-680200, offset +000000
+X	mgc_p1_0152.bin	full	vi_off	884158	663115	778475	0	640	93033
+X	mgc_p1_0152.bin	full	game	884446	663331	778475	3242	1280	92993
+X	mgc_p1_0152.bin	tri_only	vi_off	812506	609376	778475	0	640	93020
+X	mgc_p1_0152.bin	tri_only	game	812566	609420	778475	3242	1280	93034
+X	mgc_p1_0152.bin	om_no_tlut	vi_off	884504	663316	778475	0	640	93034
+X	mgc_p1_0152.bin	om_no_tlut	game	884434	663322	778475	3242	1280	93040
+X	mgc_p1_0152.bin	om_tlut_on	vi_off	884230	663168	778475	0	640	93027
+X	mgc_p1_0152.bin	om_no_dither	vi_off	884564	663361	778475	0	640	93023
+X	mgc_p1_0152.bin	om_point	vi_off	884338	663249	778475	0	640	93027
+X	mgc_p1_0152.bin	om_no_bilerp	vi_off	884528	663334	778475	0	640	92993
+X	mgc_p1_0152.bin	om_no_persp	vi_off	884482	663357	778475	0	640	93035
+X	mgc_p1_0152.bin	om_no_key	vi_off	884420	663253	778475	0	640	93011
+X	mgc_p1_0152.bin	om_no_fblend	vi_off	884362	663268	778475	0	640	93002
+X	mgc_p1_0152.bin	om_no_cvg	vi_off	884482	663358	778475	0	640	93011
+X	mgc_p1_0152.bin	om_2cyc	vi_off	1221250	915933	778475	0	640	93028
+X	mgc_p1_0152.bin	tri_flat	vi_off	884096	663010	778475	0	640	93003
+X	mgc_p1_0152.bin	tri_noshade	vi_off	887386	665535	778475	0	640	93011
+X	mgc_p1_0152.bin	tri_notex	vi_off	887170	665373	778475	0	640	93028
+X	mgc_p1_0152.bin	tri_edge	vi_off	892702	669523	778475	0	640	93051
+XI	mgc_p5_5075.bin	list 160152 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p5_5075.bin	full	vi_off	1775672	1331692	1669759	0	640	93023
+X	mgc_p5_5075.bin	full	game	1775518	1331635	1669759	3242	1280	93023
+X	mgc_p5_5075.bin	tri_only	vi_off	1656454	1242336	1669759	0	640	93013
+X	mgc_p5_5075.bin	tri_only	game	1656118	1242084	1669759	3242	1280	92972
+X	mgc_p5_5075.bin	om_no_tlut	vi_off	1775746	1331805	1669759	0	640	93023
+X	mgc_p5_5075.bin	om_no_tlut	game	1775614	1331706	1669759	3242	1280	93040
+X	mgc_p5_5075.bin	om_tlut_on	vi_off	1775458	1331589	1669759	0	640	93023
+X	mgc_p5_5075.bin	om_no_dither	vi_off	1775746	1331747	1669759	0	640	93032
+X	mgc_p5_5075.bin	om_point	vi_off	1775638	1331724	1669759	0	640	93023
+X	mgc_p5_5075.bin	om_no_bilerp	vi_off	1775758	1331814	1669759	0	640	92972
+X	mgc_p5_5075.bin	om_no_persp	vi_off	1775314	1331481	1669759	0	640	93024
+X	mgc_p5_5075.bin	om_no_key	vi_off	1775758	1331814	1669759	0	640	93024
+X	mgc_p5_5075.bin	om_no_fblend	vi_off	1775662	1331742	1669759	0	640	93024
+X	mgc_p5_5075.bin	om_no_cvg	vi_off	1775936	1331890	1669759	0	640	93031
+X	mgc_p5_5075.bin	om_2cyc	vi_off	2089736	1567240	1669759	0	640	93012
+X	mgc_p5_5075.bin	tri_flat	vi_off	1776178	1332129	1669759	0	640	93007
+X	mgc_p5_5075.bin	tri_noshade	vi_off	1779574	1334676	1669759	0	640	93006
+X	mgc_p5_5075.bin	tri_notex	vi_off	1779622	1334713	1669759	0	640	93013
+X	mgc_p5_5075.bin	tri_edge	vi_off	1785574	1339176	1669759	0	640	93068
+XI	mgc_p6_5810.bin	list 211152 B, prefix 10, z 46A000+524800, regions 213D20-680200, offset +000000
+X	mgc_p6_5810.bin	full	vi_off	1029560	772108	961353	0	640	93020
+X	mgc_p6_5810.bin	full	game	1029598	772194	961353	3242	1280	93013
+X	mgc_p6_5810.bin	tri_only	vi_off	802630	601969	961353	0	640	93013
+X	mgc_p6_5810.bin	tri_only	game	802846	602130	961353	3242	1280	93027
+X	mgc_p6_5810.bin	om_no_tlut	vi_off	1029442	772077	961353	0	640	93028
+X	mgc_p6_5810.bin	om_no_tlut	game	1029538	772150	961353	3242	1280	93022
+X	mgc_p6_5810.bin	om_tlut_on	vi_off	1029466	772095	961353	0	640	93060
+X	mgc_p6_5810.bin	om_no_dither	vi_off	1029776	772270	961353	0	640	92978
+X	mgc_p6_5810.bin	om_point	vi_off	1029442	772078	961353	0	640	93041
+X	mgc_p6_5810.bin	om_no_bilerp	vi_off	1029776	772270	961353	0	640	92979
+X	mgc_p6_5810.bin	om_no_persp	vi_off	1029466	772095	961353	0	640	93048
+X	mgc_p6_5810.bin	om_no_key	vi_off	1029442	772078	961353	0	640	93073
+X	mgc_p6_5810.bin	om_no_fblend	vi_off	1029874	772401	961353	0	640	93020
+X	mgc_p6_5810.bin	om_no_cvg	vi_off	1029442	772077	961353	0	640	93063
+X	mgc_p6_5810.bin	om_2cyc	vi_off	1237114	927831	961353	0	640	93040
+X	mgc_p6_5810.bin	tri_flat	vi_off	1029466	772096	961353	0	640	93070
+X	mgc_p6_5810.bin	tri_noshade	vi_off	1037482	778107	961353	0	640	93029
+X	mgc_p6_5810.bin	tri_notex	vi_off	1037578	778179	961353	0	640	93007
+X	mgc_p6_5810.bin	tri_edge	vi_off	1052542	789403	961353	0	640	93020
+XI	mgc_p2_1802.bin	list 239152 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p2_1802.bin	full	vi_off	2040238	1530174	2144538	0	640	92998
+X	mgc_p2_1802.bin	full	game	2040382	1530282	2144538	3242	1280	93028
+X	mgc_p2_1802.bin	tri_only	vi_off	1555544	1166596	2144538	0	640	92986
+X	mgc_p2_1802.bin	tri_only	game	1555306	1166476	2144538	3242	1280	93017
+X	mgc_p2_1802.bin	om_no_tlut	vi_off	2040022	1530012	2144538	0	640	92998
+X	mgc_p2_1802.bin	om_no_tlut	game	2040128	1530034	2144538	3242	1280	93003
+X	mgc_p2_1802.bin	om_tlut_on	vi_off	2040298	1530220	2144538	0	640	93030
+X	mgc_p2_1802.bin	om_no_dither	vi_off	2040406	1530300	2144538	0	640	93016
+X	mgc_p2_1802.bin	om_point	vi_off	2040214	1530156	2144538	0	640	93031
+X	mgc_p2_1802.bin	om_no_bilerp	vi_off	2040262	1530192	2144538	0	640	93012
+X	mgc_p2_1802.bin	om_no_persp	vi_off	2040022	1530012	2144538	0	640	92976
+X	mgc_p2_1802.bin	om_no_key	vi_off	2040178	1530129	2144538	0	640	93004
+X	mgc_p2_1802.bin	om_no_fblend	vi_off	2040178	1530129	2144538	0	640	93013
+X	mgc_p2_1802.bin	om_no_cvg	vi_off	2040332	1530187	2144538	0	640	93004
+X	mgc_p2_1802.bin	om_2cyc	vi_off	2224714	1668531	2144538	0	640	93028
+X	mgc_p2_1802.bin	tri_flat	vi_off	2040284	1530151	2144538	0	640	93014
+X	mgc_p2_1802.bin	tri_noshade	vi_off	2045384	1533976	2144538	0	640	93013
+X	mgc_p2_1802.bin	tri_notex	vi_off	2045290	1533964	2144538	0	640	93013
+X	mgc_p2_1802.bin	tri_edge	vi_off	2049512	1537072	2144538	0	640	93006

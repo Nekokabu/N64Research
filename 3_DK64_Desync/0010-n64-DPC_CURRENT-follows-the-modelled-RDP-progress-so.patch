@@ -1,0 +1,128 @@
+From 2623d6e27d7e1e1a014cf9dfeae2c5db1d472f92 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 17:18:34 +0900
+Subject: [PATCH 10/12] n64: DPC_CURRENT follows the modelled RDP progress, so
+ the RSP waits for the FIFO (task_timing v20)
+
+The renderer consumes a DPC_START..DPC_END range the moment DPC_END is written and
+DPC_CURRENT read as DPC_END at once. The real RDP only gets through the range as fast as
+it draws, and the microcode watches DPC_CURRENT: F3DEX2 writes its commands into a small
+RDRAM FIFO (8 KiB in Beetle Adventure Racing, 5% of a frame's 175 KiB of commands), waits
+whenever the next flush would overwrite what the RDP has not fetched yet, and at the end of
+the FIFO waits for DPC_CURRENT == DPC_END before wrapping.
+
+task_timing v20 replayed four of the game's graphics tasks on a console (RDRAM image, DMEM,
+IMEM and registers dumped at the task start): the RSP ends its task 0.05-0.3 VI before the
+RDP raises the Sync_Full interrupt (frame 2316: RSP 1.54 VI, RDP 1.59 VI), while in ares
+the RSP was done after 0.50 VI with the RDP drawing until 1.48 VI. The game's CPU waits for
+the SP interrupt before it goes on, so ares released it about a VI too early every frame;
+this is what kept the intro at 2.0 VI per frame against 2.5 on the console.
+
+Record the range and the work it queued at every DPC_END write and answer a DPC_CURRENT
+read with the point the completed work has reached in the oldest unfinished range (linear
+in work inside a range; DPC_END once everything is done). With that the v20 ROM shows the
+same 0.05-0.3 VI gap in ares, and the intro's frame pacing takes the shape measured on the
+console. The ranges are not saved in save states: after a load DPC_CURRENT reads as DPC_END
+until the next DPC_END write.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/rdp/io.cpp            | 21 ++++++++++++++++++++-
+ ares/n64/rdp/rdp.cpp           |  1 +
+ ares/n64/rdp/rdp.hpp           | 13 +++++++++++++
+ ares/n64/rdp/serialization.cpp |  1 +
+ 4 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/ares/n64/rdp/io.cpp b/ares/n64/rdp/io.cpp
+index 19fdf2bc..be0f086f 100644
+--- a/ares/n64/rdp/io.cpp
++++ b/ares/n64/rdp/io.cpp
+@@ -15,8 +15,20 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
+   }
+ 
+   if(address == 2) {
+-    //DPC_CURRENT
++    //DPC_CURRENT: where the RDP has got to in the ranges it was given (see Timing::ranges)
+     data.bit(0,23) = command.current;
++    if(timing.enable && timing.pending) {
++      auto& t = timing;
++      while(t.rangeCount > 1 && t.ranges[t.rangeHead].after <= t.completed) { t.rangeHead = (t.rangeHead + 1) & 2047; t.rangeCount--; }
++      if(t.rangeCount) {
++        auto& r = t.ranges[t.rangeHead];
++        u64 done = t.completed > r.before ? t.completed - r.before : 0;
++        u64 span = r.after > r.before ? r.after - r.before : 1;
++        if(done > span) done = span;
++        u32 bytes = r.end >= r.start ? r.end - r.start : 0;
++        data.bit(0,23) = (r.start + (u32)((u64)bytes * done / span)) & ~7;
++      }
++    }
+     if(&thread == &cpu) cpu.forceSynchronize();
+   }
+ 
+@@ -82,7 +94,14 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+       command.current = command.start;
+       command.startValid = 0;
+     }
++    Timing::Range range{command.current, command.end, timing.submitted, 0};
+     flushCommands();
++    range.after = timing.submitted;
++    if(timing.enable && range.after > range.before) {
++      auto& t = timing;
++      if(t.rangeCount == 2048) { t.rangeHead = (t.rangeHead + 1) & 2047; t.rangeCount--; }
++      t.ranges[(t.rangeHead + t.rangeCount) & 2047] = range; t.rangeCount++;
++    }
+     if(&thread == &cpu) cpu.forceSynchronize();
+   }
+ 
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 3e621283..7f38701e 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -28,6 +28,7 @@ auto RDP::crash(const char *reason) -> void {
+   command.bufferBusy = 1;
+   timing.pending = 0;
+   timing.syncQueued = 0;
++  timing.rangeCount = 0;
+ }
+ 
+ auto RDP::main() -> void {
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index adbd9753..cc240cb2 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -144,6 +144,19 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     u64    framePixels;
+     u64    frameCycles;
+     u64    syncFullCount;         //total Sync_Full commands seen (statistics)
++
++    //The command fetch pointer. The renderer consumes a DPC_START..DPC_END range the moment DPC_END is
++    //written, but the real RDP only gets through it as fast as it draws, and the microcode reads
++    //DPC_CURRENT to know how far: F3DEX2 writes its commands into a small RDRAM FIFO (8 KiB in Beetle
++    //Adventure Racing) and waits whenever the next flush would overwrite what the RDP has not fetched
++    //yet, and at the end of the FIFO waits for DPC_CURRENT == DPC_END before wrapping. With the pointer
++    //at the end the RSP finished a frame's task in 0.5 VI while the RDP drew for 1.5 VI; on the console
++    //the task ends 0.05-0.3 VI before the RDP does (task_timing v20). So each DPC_END write records the
++    //range and the work it queued, and DPC_CURRENT is read as the point of the oldest unfinished range
++    //that the completed work has reached.
++    struct Range { u32 start, end; u64 before, after; };
++    Range  ranges[2048];
++    u32    rangeHead, rangeCount;
+   } timing;
+ 
+   struct Command {
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index bf258ec1..41c9d9f4 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -44,6 +44,7 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.syncTargets);
+   s(timing.framePixels);
+   s(timing.frameCycles);
++  if(s.reading()) timing.rangeHead = timing.rangeCount = 0;  //the fetch-pointer ranges are not saved: DPC_CURRENT reads as DPC_END until the next DPC_END write
+ 
+   s(edge.lmajor);
+   s(edge.level);
+-- 
+2.43.0
+

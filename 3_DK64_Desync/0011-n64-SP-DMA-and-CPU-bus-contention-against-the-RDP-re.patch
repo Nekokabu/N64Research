@@ -1,0 +1,84 @@
+From 97771eac1667ed1aca18be6e5a4a32808825821e Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 19:20:41 +0900
+Subject: [PATCH 11/12] n64: SP DMA and CPU bus contention against the RDP
+ refitted on a real graphics task (task_timing v20b)
+
+task_timing v20b replays Beetle Adventure Racing's F3DEX2 graphics tasks on the console three ways: as the
+game runs them, with the output FIFO moved to a 1 MiB buffer so the RSP never waits for the RDP, and with
+the RDP frozen while the RSP runs and then released on its own. That separates the RSP alone (0.494 VI for
+frame 2316; ares 0.504), the RDP alone (1.493 VI in the game's VI mode, 1.341 with the VI off; ares 1.479
+and 1.343), the cost of the RSP's DMAs to the RDP (+0.080 VI with the VI on, +0.057 with it off; ares
+charged 0.049 either way) and the cost of the FIFO coupling itself (+0.01 VI).
+
+The RSP's 1164 DMAs per frame (168-byte list fetches, 344-byte output flushes, vertex and matrix loads)
+cost the RDP 51 clocks each with the VI off against the 45 of the back-to-back rule of rsp_timing v19b, so
+an isolated transfer gets a per-transfer cost of 9 instead of 6, and the DMA losses are now scaled by the
+same VI factor as the CPU's (the two consoles disagree here: 71 clocks per DMA on the NTSC console, 47 on
+the PAL one; the x1.28 factor sits between). The CPU side of the same measurement, the chase under the
+real task, costs the RDP 10.4 clocks per line fill with the VI off and 13.3 in the game's VI mode (v17:
+9.7 and 13.8), so the fill cost goes from 11.7 to 10 and the VI scaling of the per-transfer losses from
+x1.19 to x1.28.
+
+Frame 2316 as the game runs it: RSP end 1.477 VI, RDP 1.557 (console 1.538 / 1.587; 1.463 / 1.535 before);
+under a CPU chase 2.274 (console 2.372; 2.333 before).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/rdp/rdp.hpp | 11 ++++++++---
+ ares/n64/rsp/dma.cpp |  4 ++--
+ 2 files changed, 10 insertions(+), 5 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index cc240cb2..aeac4d87 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -103,14 +103,19 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
+     f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
+     f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+-    f64    viContendScale = 1.6;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*1.6 at 320x16 AA0 (v12: x1.25 at +15.5%)
++    f64    viContendScale = 2.4;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*2.4 at 320x16 AA0 (task_timing v20b: a
++                                   //CPU line fill costs the RDP 10.4 clocks with the VI off and 13.3 in the game's VI mode; v12 x1.25, v17 x1.42)
+     //RDP clocks lost to each transfer of another bus master while it has work in flight (rdp_timing v10, RDP drawing a game list):
+-    f64    contendCpu = 11.7;      //a CPU data cache line fill (16 bytes)
++    f64    contendCpu = 10.0;      //a CPU data cache line fill (16 bytes): 10.4 with the VI off under a real task (task_timing v20b), 9.7 (v17), 11.7 (v10)
+     f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
+     f64    contendCpuW = 1.0;      //a CPU data cache write-back (16 bytes; rdp_timing v17: a random load+store loop costs the RDP about two fills' worth, not two fills and two write-backs)
+     f64    contendCpuU = 4.0;      //an uncached CPU write (rdp_timing v17: 2.7 with the VI off, 5 in the games' VI mode)
+     f64    contendDma = 1.2;       //per 8 bytes of SP DMA, plus contendDmaBase per transfer: the RDP only gets about 36 clocks of
+-    f64    contendDmaBase = 6.0;   //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
++                                   //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
++    f64    contendDmaBase = 9.0;   //an isolated transfer costs a few clocks more than a back-to-back one: F3DEX2's 1164 DMAs per frame
++                                   //(168 B list fetches, 344 B output flushes, vertex and matrix loads) cost the RDP 51 clocks each with the VI
++                                   //off (task_timing v20b: 0.057 VI per frame; the v19b rule gives 45, this 48) and 47-71 in the game's VI mode
++                                   //depending on the console (PAL/NTSC); the contendScale factor (x1.28) sits between the two
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index ce3ff6c7..94135115 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -19,7 +19,7 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+     dma.busy    = dma.full;
+     dma.full    = {0,0};
+     dmaQueue(dmaClocks(dma.current.length) + DmaClocksPerTransfer, thread);
+-    rdp.timingDelay(rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma);  //the RDP loses the bus meanwhile
++    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());  //the RDP loses the bus meanwhile
+   }
+ }
+ 
+@@ -67,7 +67,7 @@ auto RSP::dmaTransferStep() -> void {
+     dma.current.count -= 1;
+     dma.current.dramAddress += dma.current.skip;
+     dmaQueue(dmaClocks(dma.current.length), *this);
+-    rdp.timingDelay(rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma);
++    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());
+   } else {
+     dma.busy = {0,0};
+     dma.current.length = 0xFF8;
+-- 
+2.43.0
+

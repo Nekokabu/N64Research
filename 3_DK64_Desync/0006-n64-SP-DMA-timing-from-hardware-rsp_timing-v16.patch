@@ -1,0 +1,61 @@
+From 18e11d1cac94971bd04668b8e2244c8bd64f07ba Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 31 Oct 2026 03:45:24 +0900
+Subject: [PATCH 06/12] n64: SP DMA timing from hardware (rsp_timing v16)
+
+An RSP test ROM timed 31 instruction kernels and DMA transfers of 8 to 3584 bytes on
+two consoles. The instruction timing (dual issue, the 4-cycle dependent vector result,
+load-use, branches, COP0 reads) matches ares exactly; the DMA does not: a transfer takes
+38 RSP cycles plus 0.155 per byte (8 B 38, 64 B 44, 256 B 70, 1 KiB 186, 3.5 KiB 588;
+DMEM to RDRAM 32 + 0.145 per byte) where ares charged 1 system clock per 8 bytes.
+Charge 114 system clocks per transfer and 4 per 8 bytes, and let the transfer delay the
+RDP's queued work as the other bus masters do.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
+---
+ ares/n64/rsp/dma.cpp | 6 ++++--
+ ares/n64/rsp/rsp.hpp | 3 +++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index d49cbd60..7fca587a 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -17,7 +17,8 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+     dma.current = dma.pending;
+     dma.busy    = dma.full;
+     dma.full    = {0,0};
+-    dmaQueue((dma.current.length+8) / 8 * 3, thread);
++    dmaQueue((dma.current.length+8) / 8 * DmaClocksPer8Bytes + DmaClocksPerTransfer, thread);
++    rdp.timingDelay((dma.current.length+8) / 8 * rdp.timing.contendDma);  //the RDP loses the bus meanwhile
+   }
+ }
+ 
+@@ -64,7 +65,8 @@ auto RSP::dmaTransferStep() -> void {
+   if(dma.current.count) {
+     dma.current.count -= 1;
+     dma.current.dramAddress += dma.current.skip;
+-    dmaQueue((dma.current.length+8) / 8 * 3, *this);
++    dmaQueue((dma.current.length+8) / 8 * DmaClocksPer8Bytes, *this);
++    rdp.timingDelay((dma.current.length+8) / 8 * rdp.timing.contendDma);
+   } else {
+     dma.busy = {0,0};
+     dma.current.length = 0xFF8;
+diff --git a/ares/n64/rsp/rsp.hpp b/ares/n64/rsp/rsp.hpp
+index 3f05ea5e..0dcce652 100644
+--- a/ares/n64/rsp/rsp.hpp
++++ b/ares/n64/rsp/rsp.hpp
+@@ -261,6 +261,9 @@ struct RSP : Thread, Memory::RCP<RSP> {
+   } pipeline;
+ 
+   //dma.cpp
++  //an SP DMA takes 38 RSP cycles plus 0.155 per byte on hardware (rsp_timing v16: 8 B 38, 64 B 44,
++  //256 B 70, 1 KiB 186, 3.5 KiB 588; writes to RDRAM 32 + 0.145/B), in system clocks (3 per RSP cycle):
++  enum : u32 { DmaClocksPer8Bytes = 4, DmaClocksPerTransfer = 114 };
+   auto dmaQueue(u32 clocks, Thread& thread) -> void;
+   auto dmaStep(u32 clocks) -> void;
+   auto dmaTransferStart(Thread& thread) -> void;
+-- 
+2.43.0
+

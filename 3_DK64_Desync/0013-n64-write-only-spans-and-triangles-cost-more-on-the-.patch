@@ -1,0 +1,95 @@
+From 16923da337551d0260b3e2173cf7e10aa5695bed Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Tue, 3 Nov 2026 00:13:50 +0900
+Subject: [PATCH] n64: write-only spans and triangles cost more on the console
+ (rdp_timing v29-v32, MGC 2011)
+
+The MGC 2011 demo (Retroactive) advances by rendered frames while its music
+plays in real time, so a part that renders faster than on the console runs
+ahead of the music. ares ran its part 4 (speaker room) 12% and part 5 (glass
+grid) 8% too fast, putting the picture about 7 seconds ahead of the sound by
+the RETRO logo. A resident logger in the demo (mgc_tasklog) showed the RSP
+and CPU timing identical to ares and the RDP 15-20% slower on the console for
+those parts; replaying their display lists (rdp_timing v29/v30) showed that
+no mode bit, texture format or attribute matters, only the triangles
+themselves: shade+texture triangles with no image read and no depth test.
+
+Synthetic measurements (rdp_timing v31/v32):
+- a write-only span costs 1.2 clocks more than the tables into a 320-pixel
+  colour image and 2.8 more into a 640-pixel one (1280-byte rows);
+- a write-only triangle pays for its command words: a one-span triangle costs
+  26 clocks with edges only, 35 with shade and 65 with shade and texture,
+  against 20 / 23 / 23 in the tables (+5, +7 for the shade words, +30 for
+  the texture words).
+
+With these the demo's parts are within 1-5% of the console (RETRO logo at VI
+8950 against about 9050 on the console, 8620 before) and the 12 replayed
+lists within +-5%. Donkey Kong 64 and Beetle Adventure Racing are unchanged
+(their triangles read the colour or depth buffer).
+---
+ ares/n64/rdp/rdp.hpp    |  7 ++++++-
+ ares/n64/rdp/timing.cpp | 16 ++++++++++++++++
+ 2 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 6c8588d5..8a604973 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -121,7 +121,12 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     bool   zPassAuto = true;
+     u32    zFailWidth = 16;        //spans up to this many pixels can fail the depth test as a whole; wider spans always pay the passing cost (rdp_timing v24/v28)
+     f64    atomicCost = 20.0;      //clocks per primitive with ATOMIC_PRIM set (rdp_timing v24/v25)
+-    f64    aaSpanCost = 3.5;       //clocks per span of an anti-aliased 1-cycle primitive (rdp_timing v24)
++    f64    aaSpanCost = 3.5;
++    f64    writeOnlySpan = 1.2;      //extra clocks per write-only span (no image read, no depth), 320-pixel-wide colour image (rdp_timing v31/v32)
++    f64    writeOnlySpanWide = 2.8;  //the same for a colour image wider than 320 pixels (the MGC 2011 demo's 640x480)
++    f64    writeOnlyTri = 5.0;       //extra clocks per write-only triangle: edges (+5), shade words (+7), texture words (+30)
++    f64    writeOnlyShade = 7.0;
++    f64    writeOnlyTexture = 30.0;       //clocks per span of an anti-aliased 1-cycle primitive (rdp_timing v24)
+     n1     atomicPrim;             //Set_Other_Modes bits the model needs beyond the cycle type and depth/image read
+     n1     antialias;
+     u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 00a16169..eec118b0 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -61,6 +61,8 @@ auto RDP::timingReset() -> void {
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
+   timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
++  timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
++  timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
+   timing.colorSize = 2;
+   timing.colorWidth = 319;
+   timing.textureSize = 2;
+@@ -202,6 +204,12 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+   if(cost < pipe) cost = pipe;
+   cost *= timingScale(timing.memoryBound);
+   if(timing.memoryBound) cost += timing.spanPenalty;
++  else if(timing.cycleType < 2) {
++    //write-only 1/2-cycle spans (no image read, no depth) cost a little more than the tables on the
++    //console: +1.2 clocks per span into a 320-pixel-wide colour image and +2.8 into a 640-pixel-wide
++    //one (rdp_timing v31/v32: the MGC 2011 demo's 640x480 parts)
++    cost += stride > 640 ? timing.writeOnlySpanWide : timing.writeOnlySpan;
++  }
+ 
+   timing.framePixels += pixels;
+   return cost;
+@@ -254,6 +262,14 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+   //span in 1-cycle mode (DK64 -3.2%) and nothing in 2-cycle mode (Beetle Adventure Racing: 0).
+   if(timing.atomicPrim) cycles += timing.atomicCost;
+   if(timing.antialias && timing.cycleType == 0) cycles += timing.aaSpanCost * (f64)spans;
++  if(!timing.memoryBound && timing.cycleType < 2) {
++    //a write-only triangle (no image read, no depth) pays for its command words on the console: a
++    //one-span triangle costs 26 clocks with edges only, 35 with shade and 65 with shade and texture,
++    //against 20 / 23 / 23 in the tables (rdp_timing v32)
++    cycles += timing.writeOnlyTri;
++    if(shade) cycles += timing.writeOnlyShade;
++    if(texture) cycles += timing.writeOnlyTexture;
++  }
+   timingAdd(cycles);
+ }
+ 
+-- 
+2.43.0
+

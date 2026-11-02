@@ -314,6 +314,7 @@ Results (ares default recompiler, full run from power-on):
 | **0004 to 0010: DPC_CURRENT model (series v6)** | 28 | 33/418/49 | ○ | **252/335** | +639/+667 (harness) |
 | **0004 to 0011: re-measured DMA/CPU contention (series v7)** | 29 | 26/422/52 | ○ | **249/331** | +641/+667 (harness) |
 | **0004 to 0012: Z whole-span fail only for spans of 16 px or less, ATOMIC_PRIM, 1-cycle AA (series v8)** | 29 | 24/423/53 | ○ | **249/331** | +641/+667 (harness) |
+| **0004 to 0013: write-only span / triangle costs (series v9, MGC 2011)** | 29 | 24/423/53 | ○ | **251/331** | +641/+667 (harness) |
 
 - The DK64 demo is now the series closest to the console (per-block VI counts are within 1 to 2).
 - BAR's crash scene (RDP-bound) matches the console (68/74/66 vs 70/76/69 VI/30 frames).
@@ -322,8 +323,8 @@ Results (ares default recompiler, full run from power-on):
   above it and ares below it. Slowing the CPU uniformly by 25% brings BAR closer to the console but breaks DK64, and slowing the RSP by 25% changes nothing,
   so the remaining difference is thought to be a few % on the CPU side (value-dependent FPU costs, the write buffer, super-additivity under combined loads that were not measured).
   The frame structure is the same in both the 8MB and 4MB console recordings, so the presence of the Expansion Pak is irrelevant.
-- MGC 2011 (Retroactive): in comparison with the console recording, from demo start to the RETRO logo it is 8954 VI on the console and 8547 in ares (−4.5%). Per part, −12% to +3%.
-  This demo has a different kind of load in which PI loads, the RSP, and the CPU are intermixed, and factors outside the scope of the RDP model remain.
+- MGC 2011 (Retroactive): against the console recording, demo start to the RETRO logo is about 9050 VI on the console and 8620 in ares v8 (−4.8%; part 4 −12%, part 5 −8%).
+  Series v9 (0013) gives 8950 (−1.1%), per part −4.5% to +1.6% (the "MGC 2011" section below).
 ## Hardware test ROMs v17 to v19 and the v4 model (added 2026-10-31)
 
 Up to v16, loads were measured one at a time. v17 to v19 measured **the interactions when loads are applied simultaneously**, plus the CPU
@@ -772,7 +773,48 @@ I put in three points confirmed on the console as 0012 (within error on the DK64
 2. **+20 clk for ATOMIC_PRIM triangles**.
 3. **+3.5 clk/span for AA_EN in 1-cycle mode** (0 in 2-cycle).
 
-## Changes (patches 0001 to 0012, harness 9999)
+## The MGC 2011 demo's picture running ahead of its music (mgc_tasklog, rdp_timing v29-v32, series v9) (added 2026-11-03)
+
+MGC 2011 (Retroactive) is a "frame based" demo (its nfo says so) whose music plays in real time: every scene lasts a fixed number of
+rendered frames, so **a part that ares renders faster than the console runs ahead of the music**. Per part, console recording (59.94 fps) vs ares:
+
+| Part | Console [VI] | ares v8 | v8 diff | **ares v9 (0013)** | v9 diff |
+|---|---|---|---|---|---|
+| 1 (house, weathervane, night) | 1428 | 1428 | ±0 | 1451 | +1.6% |
+| 2 (mountains, cliffs) | ≈2150 | 2081 | −3% | 2132 | −0.8% |
+| 3 (blobs, planet) | ≈2220 | 2160 | −3% | 2174 | −2% |
+| **4 (speaker room)** | **1753** | 1541 | **−12%** | **1732** | **−1.2%** |
+| **5 (glass grid)** | ≈1440 | 1328 | **−8%** | 1375 | −4.5% |
+| RETRO logo starts | ≈9050 (151 s) | 8620 (144 s, **about 7 s ahead**) | | **8950 (149 s, about 1.7 s)** | |
+
+### Isolating the cause
+- **mgc_tasklog** (`mgc_tasklog/`: the dk64_tasklog resident logger patched into the demo's libultra; it records 96 KiB from the start of part 4
+  (after VI 5000, the first graphics task 3.8 VI or more after the previous one) and writes it to the SRAM; `hw/mgc_tasklog_hw_001.srm`, ares `ares_v8.srm`):
+  on the console as in ares **a frame = the time to the DP interrupt + 0.006 VI (RDP-bound)**, **the RSP time is identical within 1%**, and only the
+  RDP time is longer on the console: ×1.15-1.20 in part 4, ×1.06-1.09 in part 5, ×1.08-1.09 in the RETRO logo.
+- **v29** (12 lists of parts 1-6 replayed, NTSC/PAL agree, `hw/v29_*`): console/ares for the triangles alone **part 4 1.17-1.27, part 5 1.08-1.12,
+  part 1 1.20, part 6 1.15, part 2 0.98, part 3 1.04**; loads, rectangles and state commands 1.00-1.03.
+- **v30** (the part 4 lists with one attribute changed at a time, `hw/v30_*`): EN_TLUT off (CI8 + TLUT textures), TLUT on for part 2 (RGBA16), dither,
+  point sampling, BI_LERP, perspective, KEY_EN, FORCE_BLEND, coverage: all **±0.1%**; slopes zeroed ±0, no texture (0E→0C) / no shade (0E→0A) +0.6%,
+  edges only (0E→08) +2.2%, 2-cycle +31% (model +30%). The attributes are not the cause.
+- **v31** (synthetic write-only spans, widths 8-64, `hw/v31_*`): a 640-pixel-wide colour image (the demo's 1280-byte rows) costs **+2 clk/span** over a
+  320-pixel one; placement (same column / same rows / side by side / same place), real triangles, slopes, texture, 512 wide and other addresses ±3%.
+  With IMAGE_READ (blend) 640 wide is +4-6 clk/span, cancelled by the table being +12 too high there (why parts 2/3 match).
+- **v32** (spans 1-16 px wide and triangles of 1-32 spans, `hw/v32_*`): the demo's triangles have a median span width of 8 px (36% under 4 px) and a
+  median of 12 spans. The console (640 wide, 32-span triangles) is **+2.8 clk/span over the table** (nearly constant over widths 1-16; +1.2 at 320),
+  and **a one-span triangle costs 65 clk** (edges only 26, shade 35, shade + texture 65) against 20 / 23 / 23 in the tables: a write-only triangle
+  pays for its command words (the 8 texture coefficient words alone +30 clk), which the tables did not have (in the modes with depth or blending it is
+  hidden under the 38+ clk fixed cost per span).
+
+### The fix (patch 0013: `n64: write-only spans and triangles cost more on the console`)
+Write-only (no IMAGE_READ, no depth) 1/2-cycle spans get **+1.2 clk (colour image up to 320 px wide) / +2.8 clk (wider)** and write-only triangles
+**+5 (edges) +7 (shade words) +30 (texture words)** (`writeOnlySpan` / `writeOnlySpanWide` / `writeOnlyTri` / `writeOnlyShade` / `writeOnlyTexture`
+in `rdp.hpp`). The 12 lists come out at console/ares 0.96-1.06 (mean 1.02), the demo itself as in the table above, and DK64 / BAR are unchanged
+(their triangles read the colour or depth buffer; the series v9 row of the results table). Harness knobs: `T_WOSPAN` / `T_WOSPANW` / `T_WOTRI` /
+`T_WOSHADE` / `T_WOTEX`. The remaining −4.5% (part 5) is in scenes mixing 1CYC16_BLEND (read-modify-write) spans, where v31's blend640 +4-6 clk/span
+is left to cancel against the table's excess.
+
+## Changes (patches 0001 to 0013, harness 9999)
 
 (`0001` is an independent bug fix: in `ares/n64/rdp/io.cpp` `RDP::readWord`, the DPC_TMEM_BUSY check was written as `if(data == 7)`, a typo that made the
 TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
@@ -780,9 +822,9 @@ TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
 Files changed by `0002` (the RDP model): `ares/n64/rdp/timing.cpp` (new), `ares/n64/rdp/timing-model.hpp` (new, the console-measured table),
 `rdp.hpp`, `rdp.cpp`, `render.cpp`, `io.cpp`, `serialization.cpp`, `vulkan/vulkan.cpp`, `system/serialization.cpp` (state version v154),
 `n64/CMakeLists.txt`. Files changed by `0003` (CPU stalls): `ares/n64/cpu/cpu.hpp`, `cpu.cpp`, `dcache.cpp`, `recompiler.cpp`.
-All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0012 with `git am`, 9999 with `git apply --check`).
+All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0013 with `git am`, 9999 with `git apply --check`).
 `0012` is the model from the v24/v25/v28 sections (Z makes the whole span fail only for spans of 16 px or less, ATOMIC_PRIM at 20 clk/primitive, 1-cycle AA at 3.5 clk/span,
-and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
+and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), `0013` is the model of the MGC 2011 section (write-only span / triangle costs), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
 `0007` is the PI timing fix that gets past the MGC 2011 demo's emulator detection (`n64: make cartridge ROM ignore PI accesses faster than a mask ROM can serve`, in `cartridge.hpp` and `pi/device.hpp`), `0008`/`0009` are the models from the v17 to v19 sections above, `0010` is the v20 section's, and `0011` is the v20b section's.
 
 1. **RDP execution time model** (`timing.cpp` + `timing-model.hpp`)
@@ -829,6 +871,7 @@ git am 0009-n64-SP-DMA-slowed-by-the-VI-and-by-CPU-line-transfer.patch   # v19/v
 git am 0010-n64-DPC_CURRENT-follows-the-modelled-RDP-progress-so.patch   # v20: RSP waits for the RDP on the FIFO
 git am 0011-n64-SP-DMA-and-CPU-bus-contention-against-the-RDP-re.patch   # v20b: re-measurement of the time SP DMA / CPU fills take from the RDP
 git am 0012-n64-depth-test-savings-only-for-short-spans-ATOMIC_P.patch   # v24/v25/v28: depth-test savings only for spans up to 16 px, ATOMIC_PRIM, 1-cycle AA
+git am 0013-n64-write-only-spans-and-triangles-cost-more-on-the-.patch   # v29-v32: write-only span / triangle costs (MGC 2011)
 # Build as usual (cmake -B build && cmake --build build)
 ```
 
