@@ -6,8 +6,8 @@ Subject: [PATCH 9999] harness: headless verification harness and core instrument
 Not for upstream: the headless/ runner (frame-limited runs with RAM watches, input
 scripts, RAM dumps, RDP list dumps), the T_* environment knobs for every timing
 constant, the ARES_*_LOG traces, and the experimental models (RDP edge walker,
-per-triangle costs, Z coverage estimator) used to verify series v9 against the
-console measurements. Apply after 0013 with `git apply`.
+per-triangle costs, Z coverage estimator) used to verify series v10 against the
+console measurements. Apply after 0014 with `git apply`.
 
 ---
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -1603,7 +1603,7 @@ index 7f38701e..a29765e5 100644
      command.clock += clocks / 3;
    }
 diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
-index 8a604973..d2ea28f3 100644
+index 465dec4a..c14e652f 100644
 --- a/ares/n64/rdp/rdp.hpp
 +++ b/ares/n64/rdp/rdp.hpp
 @@ -84,6 +84,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
@@ -1611,7 +1611,7 @@ index 8a604973..d2ea28f3 100644
    auto timingAdd(f64 cycles) -> void;
    auto timingDelay(f64 cycles) -> void;
 +  u64 dpcRspReads[8] = {}, dpcRspWrites[8] = {};  //HARNESS
-+  u32 rasterModel = 0; u32 zNarrow = 16;  //HARNESS T_RASTER, T_ZNARROW (default = 0012: depth-test savings only for spans up to 16 px)
++  u32 rasterModel = 0; u32 widenModel = 0; u32 zNarrow = 16;  //HARNESS T_RASTER, T_ZNARROW (default = 0012: depth-test savings only for spans up to 16 px)
 +  f64 atomicCost = 20.0; f64 aa1Span = 3.5;  //HARNESS T_ATOMIC / T_AA1 (defaults = 0012)
 +  f64 triOverhead = -1.0; f64 triSpanPenalty = 15.0; f64 spanWide = 0.0;  //HARNESS: T_TRIOV / T_TRISP / T_SPWIDE (rdp_timing v22 W)
 +  u32 viWhole = 0;  //HARNESS: 1 = VI factor applied to the whole list instead of spans/loads only
@@ -1620,7 +1620,7 @@ index 8a604973..d2ea28f3 100644
  
    //serialization.cpp
    auto serialize(serializer&) -> void;
-@@ -94,45 +101,31 @@ struct RDP : Thread, Memory::RCP<RDP> {
+@@ -94,34 +101,21 @@ struct RDP : Thread, Memory::RCP<RDP> {
    struct Timing {
      //tunables
      bool   enable = true;
@@ -1668,11 +1668,12 @@ index 8a604973..d2ea28f3 100644
      f64    writeOnlySpan = 1.2;      //extra clocks per write-only span (no image read, no depth), 320-pixel-wide colour image (rdp_timing v31/v32)
      f64    writeOnlySpanWide = 2.8;  //the same for a colour image wider than 320 pixels (the MGC 2011 demo's 640x480)
      f64    writeOnlyTri = 5.0;       //extra clocks per write-only triangle: edges (+5), shade words (+7), texture words (+30)
-     f64    writeOnlyShade = 7.0;
--    f64    writeOnlyTexture = 30.0;       //clocks per span of an anti-aliased 1-cycle primitive (rdp_timing v24)
+@@ -132,12 +126,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    sameBank2 = 1.165;        //the same, wider spans, 2-cycle
+     f64    loadStride = 1.2;         //extra clocks per Load_Tile row when the source rows are 512..1023 bytes apart (rdp_timing v34)
+     f64    loadStrideWide = 2.3;     //the same, 1024 bytes or more
 -    n1     atomicPrim;             //Set_Other_Modes bits the model needs beyond the cycle type and depth/image read
 -    n1     antialias;
-+    f64    writeOnlyTexture = 30.0;
      u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
  
      //state decoded from the command stream (only what the model needs)
@@ -1681,7 +1682,7 @@ index 8a604973..d2ea28f3 100644
      n1     imageRead;
      n1     zCompare;
      n1     zUpdate;
-@@ -159,19 +152,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
+@@ -165,19 +158,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
      u64    framePixels;
      u64    frameCycles;
      u64    syncFullCount;         //total Sync_Full commands seen (statistics)
@@ -1709,10 +1710,10 @@ index 8a604973..d2ea28f3 100644
  
    struct Command {
 diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
-index 88678057..bf258ec1 100644
+index 34c57415..939c67e4 100644
 --- a/ares/n64/rdp/serialization.cpp
 +++ b/ares/n64/rdp/serialization.cpp
-@@ -37,8 +37,6 @@ auto RDP::serialize(serializer& s) -> void {
+@@ -38,8 +38,6 @@ auto RDP::serialize(serializer& s) -> void {
    s(timing.accumulated);
    s(timing.zPassFraction);
    s(timing.frameZPixels);
@@ -1721,7 +1722,7 @@ index 88678057..bf258ec1 100644
    s(timing.submitted);
    s(timing.completed);
    s(timing.pending);
-@@ -46,7 +44,6 @@ auto RDP::serialize(serializer& s) -> void {
+@@ -47,7 +45,6 @@ auto RDP::serialize(serializer& s) -> void {
    s(timing.syncTargets);
    s(timing.framePixels);
    s(timing.frameCycles);
@@ -1730,7 +1731,7 @@ index 88678057..bf258ec1 100644
    s(edge.lmajor);
    s(edge.level);
 diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
-index eec118b0..80123276 100644
+index 4c8b1a35..c966a926 100644
 --- a/ares/n64/rdp/timing.cpp
 +++ b/ares/n64/rdp/timing.cpp
 @@ -53,14 +53,14 @@ auto RDP::timingReset() -> void {
@@ -1751,8 +1752,8 @@ index eec118b0..80123276 100644
 +  timing.zPassAuto = t.zPassAuto;
    timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
    timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
-   timing.colorSize = 2;
-@@ -73,6 +73,7 @@ auto RDP::timingReset() -> void {
+   timing.sameBankNarrow = t.sameBankNarrow; timing.sameBank1 = t.sameBank1; timing.sameBank2 = t.sameBank2;
+@@ -75,6 +75,7 @@ auto RDP::timingReset() -> void {
  //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
  auto RDP::timingAdd(f64 cycles) -> void {
    if(!timing.enable || cycles <= 0.0) return;
@@ -1760,7 +1761,7 @@ index eec118b0..80123276 100644
    timing.frameCycles += (u64)cycles;
    timing.accumulated += cycles * 3.0;
    u64 work = (u64)timing.accumulated;
-@@ -84,7 +85,10 @@ auto RDP::timingAdd(f64 cycles) -> void {
+@@ -86,7 +87,10 @@ auto RDP::timingAdd(f64 cycles) -> void {
  //another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
  //everything queued, including the Sync_Full interrupts already waiting, completes that much later
  auto RDP::timingDelay(f64 cycles) -> void {
@@ -1772,7 +1773,7 @@ index eec118b0..80123276 100644
    timing.accumulated += cycles * 3.0;
    u64 work = (u64)timing.accumulated;
    timing.accumulated -= work;
-@@ -133,29 +137,41 @@ auto RDP::timingMode() -> u32 {
+@@ -135,29 +139,41 @@ auto RDP::timingMode() -> u32 {
    return timing.mode = mode;
  }
  
@@ -1820,7 +1821,7 @@ index eec118b0..80123276 100644
    u32 bytes = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
    u32 stride = (timing.colorWidth + 1) * bytes;
    u32 address = timing.colorAddress + y * stride + x * bytes;
-@@ -183,14 +199,14 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+@@ -185,14 +201,14 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
      f64 pass = rdp_tm_span(zpass, address, w);
      f64 fail = rdp_tm_span(zfail, address, w);
      timing.frameZPixels += pixels;
@@ -1842,7 +1843,7 @@ index eec118b0..80123276 100644
      } else {
        auto partial = timing.zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD;
        f64 ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
-@@ -211,7 +227,9 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+@@ -222,7 +238,9 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
      cost += stride > 640 ? timing.writeOnlySpanWide : timing.writeOnlySpan;
    }
  
@@ -1853,7 +1854,7 @@ index eec118b0..80123276 100644
    return cost;
  }
  
-@@ -237,7 +255,41 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+@@ -248,7 +266,41 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
    if(rowEnd - rowStart > 1024) rowEnd = rowStart + 1024;  //guard against garbage
  
    f64 cycles = 0.0;
@@ -1896,7 +1897,27 @@ index eec118b0..80123276 100644
    for(s32 row = rowStart; row < rowEnd; row++) {
      f64 yc = row + 0.5;
      if(yc < fyh || yc >= fyl) continue;
-@@ -251,17 +303,22 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+@@ -256,23 +308,42 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     f64 xMinor = yc < fym ? fxm + fdxmdy * (yc - fyh) : fxl + fdxldy * (yc - fym);
+     f64 x0 = xMajor < xMinor ? xMajor : xMinor;
+     f64 x1 = xMajor < xMinor ? xMinor : xMajor;
++    if(widenModel) {
++      //HARNESS T_WIDEN: the span covers the union of the four sub-scanlines' extents (rdp_timing v36: edges slanted
++      //8 px per row cost like spans 6 px wider); the row set stays the centre-line one
++      for(s32 k = 0; k < 4; k++) {
++        f64 ys = row + 0.125 + 0.25 * k;
++        if(ys < fyh || ys >= fyl) continue;
++        f64 a = fxh + fdxhdy * (ys - fyh);
++        f64 b = ys < fym ? fxm + fdxmdy * (ys - fyh) : fxl + fdxldy * (ys - fym);
++        if(a > b) { f64 t = a; a = b; b = t; }
++        if(a < x0) x0 = a;
++        if(b > x1) x1 = b;
++      }
++      if(widenModel == 2) { x0 = floor(x0); x1 = floor(x1) + 1.0; }  //whole pixels, inclusive of the last
++    }
+     if(x0 < timing.scissorX0) x0 = timing.scissorX0;
+     if(x1 > timing.scissorX1) x1 = timing.scissorX1;
+     if(x1 <= x0) continue;
      u32 pixels = (u32)(x1 - x0 + 0.5);
      if(pixels == 0) pixels = 1;
      if(pixels > widest) widest = pixels;
@@ -1925,7 +1946,7 @@ index eec118b0..80123276 100644
    if(!timing.memoryBound && timing.cycleType < 2) {
      //a write-only triangle (no image read, no depth) pays for its command words on the console: a
      //one-span triangle costs 26 clocks with edges only, 35 with shade and 65 with shade and texture,
-@@ -270,6 +327,10 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+@@ -281,6 +352,10 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
      if(shade) cycles += timing.writeOnlyShade;
      if(texture) cycles += timing.writeOnlyTexture;
    }
@@ -1936,7 +1957,7 @@ index eec118b0..80123276 100644
    timingAdd(cycles);
  }
  
-@@ -283,10 +344,16 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
+@@ -294,10 +369,16 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
    if(py1 > timing.scissorY1) py1 = timing.scissorY1;
    f64 cycles = 0.0;
    u32 width = px1 > px0 ? px1 - px0 : 0;
@@ -1953,7 +1974,7 @@ index eec118b0..80123276 100644
    timingAdd(cycles);
  }
  
-@@ -319,6 +386,9 @@ auto RDP::timingStep(u32 clocks) -> u32 {
+@@ -330,6 +411,9 @@ auto RDP::timingStep(u32 clocks) -> u32 {
  
  //a Sync_Full has finished executing: signal the CPU
  auto RDP::timingComplete() -> void {
@@ -1963,7 +1984,7 @@ index eec118b0..80123276 100644
    if(!command.crashed) {
      mi.raise(MI::IRQ::DP);
      if(timing.pending == 0) {
-@@ -327,11 +397,16 @@ auto RDP::timingComplete() -> void {
+@@ -338,11 +422,16 @@ auto RDP::timingComplete() -> void {
        command.startGclk = 0;
      }
    }
@@ -1980,7 +2001,7 @@ index eec118b0..80123276 100644
      if(area > 0 && timing.frameZPixels > 0) {
        f64 n = timing.frameZPixels / area;
        if(n < 1.0) n = 1.0;
-@@ -342,9 +417,10 @@ auto RDP::timingComplete() -> void {
+@@ -353,9 +442,10 @@ auto RDP::timingComplete() -> void {
        timing.zPassFraction = f;
      }
    }
@@ -1992,7 +2013,7 @@ index eec118b0..80123276 100644
  }
  
  //account for one complete RDP command (ops[0] holds the first 64-bit word)
-@@ -353,6 +429,117 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -364,6 +454,117 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    u64 op = ops[0];
    u32 code = op >> 56 & 0x3f;
    const f64 state = rdp_tm_state_cmd(command.source);
@@ -2110,7 +2131,7 @@ index eec118b0..80123276 100644
  
    //bytes per texel of the texture image, times two (so that 4bpp is 1)
    auto texelBytes2 = [&](u32 texels) -> u32 {
-@@ -373,6 +560,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -384,6 +585,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    case 0x25: { //Texture_Rectangle_Flip
      s32 x1 = n12(op >> 44), y1 = n12(op >> 32);
      s32 x0 = n12(op >> 12), y0 = n12(op >>  0);
@@ -2118,7 +2139,7 @@ index eec118b0..80123276 100644
      timingRectangle(x0, y0, x1, y1, false);
    } break;
  
-@@ -396,8 +584,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -407,8 +609,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
      timing.imageRead = n1(op >>  6);
      timing.zUpdate   = n1(op >>  5);
      timing.zCompare  = n1(op >>  4);
@@ -2128,7 +2149,7 @@ index eec118b0..80123276 100644
      timingMode();
      timingAdd(state);
    } break;
-@@ -405,14 +592,14 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -416,14 +617,14 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    case 0x30: { //Load_TLUT
      s32 s0 = n12(op >> 44) >> 2, s1 = n12(op >> 12) >> 2;
      u32 count = s1 >= s0 ? s1 - s0 + 1 : 0;
@@ -2145,12 +2166,12 @@ index eec118b0..80123276 100644
    } break;
  
    case 0x34: { //Load_Tile
-@@ -424,7 +611,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
-     u32 rowBytes = texelBytes2(w) >> 1;
-     u32 address  = timing.textureAddress + t0 * stride + (texelBytes2(s0) >> 1);
-     if(h > 1024) h = 1024;  //guard against garbage
--    timingAdd(rdp_tm_load_tile(address, stride, rowBytes, h) * timingScale(false));
-+    { f64 c_ = rdp_tm_load_tile(address, stride, rowBytes, h) * timingScale(false); timing.frameModeCycles[64] += c_; timingAdd(c_); }
+@@ -438,7 +639,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+     //rows of the source image further apart than 512 / 1024 bytes cost 1.2 / 2.3 clocks more each (rdp_timing v34: a 32x32
+     //RGBA16 tile out of a 320-pixel-wide image +4.8%, out of a 640-pixel-wide one +8.5%)
+     f64 strideCost = stride >= 1024 ? timing.loadStrideWide : stride >= 512 ? timing.loadStride : 0.0;
+-    timingAdd((rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false));
++    { f64 c_ = (rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false); timing.frameModeCycles[64] += c_; timingAdd(c_); }
    } break;
  
    case 0x36: { //Fill_Rectangle
@@ -2416,10 +2437,10 @@ index 00000000..5fffce7e
 +set_target_properties(headless PROPERTIES PREFIX "")
 diff --git a/headless/main.cpp b/headless/main.cpp
 new file mode 100644
-index 00000000..a3d0b26d
+index 00000000..2b109a25
 --- /dev/null
 +++ b/headless/main.cpp
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,420 @@
 +#include <algorithm>
 +#include <unordered_map>
 +// Minimal headless harness for the ares N64 core (debugging aid, not part of ares proper).
@@ -2699,12 +2720,18 @@ index 00000000..a3d0b26d
 +    if(auto v = getenv("T_CURQ")) rdp.curQuantum = atoi(v);
 +    if(auto v = getenv("T_VIWHOLE")) rdp.viWhole = atoi(v);
 +    if(auto v = getenv("T_RASTER")) rdp.rasterModel = atoi(v);
++    if(auto v = getenv("T_WIDEN")) rdp.widenModel = atoi(v);
 +    if(auto v = getenv("T_ZNARROW")) rdp.zNarrow = atoi(v);
 +    if(auto v = getenv("T_WOSPAN")) rdp.timing.writeOnlySpan = atof(v);      //0013: write-only span / wide image / triangle costs
 +    if(auto v = getenv("T_WOSPANW")) rdp.timing.writeOnlySpanWide = atof(v);
 +    if(auto v = getenv("T_WOTRI")) rdp.timing.writeOnlyTri = atof(v);
 +    if(auto v = getenv("T_WOSHADE")) rdp.timing.writeOnlyShade = atof(v);
 +    if(auto v = getenv("T_WOTEX")) rdp.timing.writeOnlyTexture = atof(v);
++    if(auto v = getenv("T_BANKN")) rdp.timing.sameBankNarrow = atof(v);   //0014: depth buffer in the colour buffer's megabyte, Load_Tile stride
++    if(auto v = getenv("T_BANK1")) rdp.timing.sameBank1 = atof(v);
++    if(auto v = getenv("T_BANK2")) rdp.timing.sameBank2 = atof(v);
++    if(auto v = getenv("T_LDSTRIDE")) rdp.timing.loadStride = atof(v);
++    if(auto v = getenv("T_LDSTRIDEW")) rdp.timing.loadStrideWide = atof(v);
 +    if(auto v = getenv("T_ATOMIC")) rdp.atomicCost = atof(v);
 +    if(auto v = getenv("T_AA1")) rdp.aa1Span = atof(v);
 +    if(auto v = getenv("T_TRIOV")) rdp.triOverhead = atof(v);
@@ -2864,5 +2891,3 @@ index 982c745c..9c9d4372 100644
    if(eeprom) {
    s += "    memory\n";
    s += "      type: EEPROM\n";
--- 
-2.43.0

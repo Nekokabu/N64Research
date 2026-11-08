@@ -1,0 +1,113 @@
+# rdp_timing v25 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E3480; dma buffer at 0x7D0000; heap top 0x0E5000; display buffer at 0x04CD00; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	125
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1410953	1058209	1181238	0	640	93035
+X	mgc_p4_4316.bin	full	game	1459253	1094373	1181238	3242	1280	93703
+X	mgc_p4_4316.bin	tri_only	vi_off	1306457	979837	1181238	0	640	93013
+X	mgc_p4_4316.bin	tri_only	game	1348805	1011599	1181238	3242	1280	94169
+# Y lines: case, w, H, triangles, spans, clock (smallest of 3), ticks, clocks/span, clocks/triangle, VI probe. VI off, depth cleared far (all pass), 2cyc_tex_blend_z unless the case says otherwise
+# v24 cases: zfail = depth cleared nearest; no_zcmp / no_zupd / no_imrd = that mode bit off; fbzb_* = colour / depth buffers at those RDRAM addresses (adjacent = depth right after colour; bar = 0x200000 / 0x3DA800 as the game; bar_reloc / dk_reloc = as replayed in X); random_rows / random_cols = only the row / only the column random; 1cyc_atomic / 2cyc_atomic / dk_om_noatomic = ATOMIC_PRIM
+# Y cases: base = v22's W triangle (vertical edges at integer x, random position, 1/32 texel per pixel, constant shade/z); frac = edges at x+0.5; shear_half/two = all edges slanted 0.5/2 px per row (spans stay w wide); apex = real triangle, apex on top, base 2w (spans average w)
+#   aa = AA_EN; persp = TEX_PERSP; lod = TEX_LOD (tile 1 = tile 0); dither = rgb/alpha dither on; point = point sampling; cvg = ALPHA_CVG_SEL + CVG_DST full; bar_om = BAR's other modes 0x182c0f/0x0c182078; dk_om = DK64's 0x882c0f/0x00552078 (1-cycle)
+#   slopes = shade/texture (1 texel per pixel)/depth slopes nonzero; strip = triangles side by side along rows; same_place = every triangle at the same spot; state_every1/8 = Set_Other_Modes + Set_Combine before every / every 8th triangle; syncpipe_every1 = Sync_Pipe before every triangle; tile_every1 = Set_Tile + Set_Tile_Size + Sync_Tile before every triangle; load_every8 = Sync_Load + Load_Block (64 B) + Sync_Tile before every 8th
+#   ci4_tlut / rgba32_tex / i8_tex = texture format; op_0b/0d/09/08 = triangle command type (texture+z 14 words / shade+z 14 / z 6 / plain 4; the combiner reads the missing attribute from the previous one)
+Y	bar_base	4	8	512	4096	362934	272195	88.61	708.9	93019
+Y	bar_base	13	8	512	4096	477534	358145	116.59	932.7	93026
+Y	bar_base	32	8	512	4096	689693	517265	168.38	1347.1	93013
+Y	bar_base	64	8	512	4096	975505	731598	238.16	1905.3	92987
+Y	bar_clip_right	4	8	512	4096	406926	305189	99.35	794.8	93030
+Y	bar_clip_right	13	8	512	4096	390762	293067	95.40	763.2	92972
+Y	bar_clip_right	32	8	512	4096	429113	321831	104.76	838.1	93012
+Y	bar_clip_right	64	8	512	4096	595601	446697	145.41	1163.3	92973
+Y	bar_clip_left	4	8	512	4096	208518	156384	50.91	407.3	93039
+Y	bar_clip_left	13	8	512	4096	255990	191988	62.50	500.0	92992
+Y	bar_clip_left	32	8	512	4096	463793	347840	113.23	905.8	92992
+Y	bar_clip_left	64	8	512	4096	857369	643023	209.32	1674.5	93008
+Y	bar_clip_bottom	4	8	512	4096	151134	113346	36.90	295.2	93012
+Y	bar_clip_bottom	13	8	512	4096	193433	145071	47.22	377.8	92993
+Y	bar_clip_bottom	32	8	512	4096	314370	235773	76.75	614.0	93001
+Y	bar_clip_bottom	64	8	512	4096	469589	352187	114.65	917.2	93014
+Y	bar_offscreen	4	8	512	4096	45029	33768	10.99	87.9	93036
+Y	bar_offscreen	13	8	512	4096	45041	33777	11.00	88.0	93013
+Y	bar_offscreen	32	8	512	4096	45053	33785	11.00	88.0	93045
+Y	bar_offscreen	64	8	512	4096	45053	33786	11.00	88.0	93014
+Y	bar_apex_clipr	4	8	512	4096	425813	319356	103.96	831.7	93025
+Y	bar_apex_clipr	13	8	512	4096	440814	330605	107.62	861.0	92979
+Y	bar_apex_clipr	32	8	512	4096	496289	372213	121.16	969.3	93001
+Y	bar_apex_clipr	64	8	512	4096	650642	487950	158.85	1270.8	93018
+Y	bar_shear8	4	8	512	4096	431958	323963	105.46	843.7	93027
+Y	bar_shear8	13	8	512	4096	541553	406161	132.22	1057.7	93022
+Y	bar_shear8	32	8	512	4096	743886	557909	181.61	1452.9	92993
+Y	bar_shear8	64	8	512	4096	1026396	769767	250.58	2004.7	93006
+Y	bar_degenerate	4	8	512	4096	223278	167453	54.51	436.1	93021
+Y	bar_degenerate	13	8	512	4096	223134	167345	54.48	435.8	93014
+Y	bar_degenerate	32	8	512	4096	223169	167372	54.48	435.9	92991
+Y	bar_degenerate	64	8	512	4096	223121	167337	54.47	435.8	92994
+Y	bar_align_dk	4	8	512	4096	352566	264420	86.08	688.6	93019
+Y	bar_align_dk	13	8	512	4096	457433	343070	111.68	893.4	93000
+Y	bar_align_dk	32	8	512	4096	661169	495873	161.42	1291.3	92973
+Y	bar_align_dk	64	8	512	4096	932647	699459	227.70	1821.6	92989
+Y	bar_align_c1k	4	8	512	4096	352266	264195	86.00	688.0	93017
+Y	bar_align_c1k	13	8	512	4096	457457	343089	111.68	893.5	92965
+Y	bar_align_c1k	32	8	512	4096	660462	495342	161.25	1290.0	93053
+Y	bar_align_c1k	64	8	512	4096	932573	699426	227.68	1821.4	92969
+Y	bar_align_z1k	4	8	512	4096	352098	264068	85.96	687.7	93088
+Y	bar_align_z1k	13	8	512	4096	457253	342936	111.63	893.1	92994
+Y	bar_align_z1k	32	8	512	4096	660521	495386	161.26	1290.1	93021
+Y	bar_align_z1k	64	8	512	4096	932610	699452	227.69	1821.5	92969
+Y	bar_align_c64	4	8	512	4096	352553	264410	86.07	688.6	93014
+Y	bar_align_c64	13	8	512	4096	457484	343087	111.69	893.5	92992
+Y	bar_align_c64	32	8	512	4096	660642	495476	161.29	1290.3	92991
+Y	bar_align_c64	64	8	512	4096	933089	699813	227.80	1822.4	93001
+Y	bar_align_ref	4	8	512	4096	352505	264375	86.06	688.5	93041
+Y	bar_align_ref	13	8	512	4096	457385	343035	111.67	893.3	92964
+Y	bar_align_ref	32	8	512	4096	660569	495422	161.27	1290.2	92989
+Y	bar_align_ref	64	8	512	4096	933054	699786	227.80	1822.4	93020
+Y	bar_tex_rot90	4	8	512	4096	362950	272181	88.61	708.9	93003
+Y	bar_tex_rot90	13	8	512	4096	477377	358028	116.55	932.4	92971
+Y	bar_tex_rot90	32	8	512	4096	689585	517184	168.36	1346.8	93022
+Y	bar_tex_rot90	64	8	512	4096	975521	731636	238.16	1905.3	92985
+Y	bar_tex_rot45	4	8	512	4096	362861	272142	88.59	708.7	93068
+Y	bar_tex_rot45	13	8	512	4096	477449	358082	116.56	932.5	92992
+Y	bar_tex_rot45	32	8	512	4096	689897	517419	168.43	1347.5	93014
+Y	bar_tex_rot45	64	8	512	4096	975306	731474	238.11	1904.9	92986
+Y	bar_tex_min4t	4	8	512	4096	362897	272169	88.60	708.8	93017
+Y	bar_tex_min4t	13	8	512	4096	477390	358037	116.55	932.4	92994
+Y	bar_tex_min4t	32	8	512	4096	689641	517200	168.37	1347.0	93022
+Y	bar_tex_min4t	64	8	512	4096	975245	731430	238.10	1904.8	93006
+Y	dk_align_dk	4	8	512	4096	352733	264545	86.12	688.9	93004
+Y	dk_align_dk	13	8	512	4096	448880	336634	109.59	876.7	93016
+Y	dk_align_dk	32	8	512	4096	610337	457749	149.01	1192.1	93008
+Y	dk_align_dk	64	8	512	4096	872875	654630	213.10	1704.8	93011
+Y	dk_align_ref	4	8	512	4096	352962	264717	86.17	689.4	92991
+Y	dk_align_ref	13	8	512	4096	448733	336545	109.55	876.4	93032
+Y	dk_align_ref	32	8	512	4096	609497	457119	148.80	1190.4	93007
+Y	dk_align_ref	64	8	512	4096	872550	654407	213.02	1704.2	93021
+Y	dk_clip_right	4	8	512	4096	404202	303147	98.68	789.5	93025
+Y	dk_clip_right	13	8	512	4096	417397	313017	101.90	815.2	93032
+Y	dk_clip_right	32	8	512	4096	428165	321120	104.53	836.3	93040
+Y	dk_clip_right	64	8	512	4096	517794	388340	126.41	1011.3	92997
+Y	dk_offscreen	4	8	512	4096	66737	50048	16.29	130.3	93002
+Y	dk_offscreen	13	8	512	4096	66737	50049	16.29	130.3	92995
+Y	dk_offscreen	32	8	512	4096	66738	50049	16.29	130.3	93017
+Y	dk_offscreen	64	8	512	4096	66737	50049	16.29	130.3	92974
+Y	wo_clip_right	4	8	512	4096	97686	73259	23.85	190.8	93011
+Y	wo_clip_right	13	8	512	4096	109073	81800	26.63	213.0	93037
+Y	wo_clip_right	32	8	512	4096	127482	95607	31.12	249.0	93031
+Y	wo_clip_right	64	8	512	4096	193733	145296	47.30	378.4	93034
+Y	wo_offscreen	4	8	512	4096	44801	33597	10.94	87.5	93011
+Y	wo_offscreen	13	8	512	4096	44826	33614	10.94	87.6	93032
+Y	wo_offscreen	32	8	512	4096	44754	33560	10.93	87.4	93013
+Y	wo_offscreen	64	8	512	4096	44849	33632	10.95	87.6	93037

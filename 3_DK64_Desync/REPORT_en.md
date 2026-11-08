@@ -315,6 +315,7 @@ Results (ares default recompiler, full run from power-on):
 | **0004 to 0011: re-measured DMA/CPU contention (series v7)** | 29 | 26/422/52 | ○ | **249/331** | +641/+667 (harness) |
 | **0004 to 0012: Z whole-span fail only for spans of 16 px or less, ATOMIC_PRIM, 1-cycle AA (series v8)** | 29 | 24/423/53 | ○ | **249/331** | +641/+667 (harness) |
 | **0004 to 0013: write-only span / triangle costs (series v9, MGC 2011)** | 29 | 24/423/53 | ○ | **251/331** | +641/+667 (harness) |
+| **0004 to 0014: colour/depth in the same megabyte, Load_Tile source stride (series v10)** | 29 | 24/423/53 | ○ | **251/331** | +641/+667 (harness) |
 
 - The DK64 demo is now the series closest to the console (per-block VI counts are within 1 to 2).
 - BAR's crash scene (RDP-bound) matches the console (68/74/66 vs 70/76/69 VI/30 frames).
@@ -814,7 +815,153 @@ in `rdp.hpp`). The 12 lists come out at console/ares 0.96-1.06 (mean 1.02), the 
 `T_WOSHADE` / `T_WOTEX`. The remaining −4.5% (part 5) is in scenes mixing 1CYC16_BLEND (read-modify-write) spans, where v31's blend640 +4-6 clk/span
 is left to cancel against the table's excess.
 
-## Changes (patches 0001 to 0013, harness 9999)
+## Test ROMs v33-v35: the structure of the triangle fixed cost, rectangles and loads, buffer placement (added 2026-11-08)
+
+After MGC, three synthetic ROMs measured the remaining per-class residuals (BAR intro −10%, v15's rectangles 1.01-1.09 and loads 1.06-1.07,
+v24's "same megabyte"): NTSC, `hw/v33_*`-`hw/v35_*`, sources in `rdp_timing/v33`-`v35`.
+
+### v33: the fixed cost of a triangle and the span cost in the games' modes (depth and blending)
+BAR's 2-cycle mode (0x182c0f / 0x0c182078) and DK64's 1-cycle mode (0x882c0f / 0x00552078), triangles of 1 / 2 / 4 / 8 / 32 spans × widths 1-32 px,
+decomposed as `clk/triangle = T + H × s(w)`:
+
+| | console T (fixed) | console s(w) − ares s(w) | one-span triangle (0F) console / ares |
+|---|---|---|---|
+| BAR 2cyc | 40-50 clk | −9 (w1) to −16 (w16), −26 (w32) | 116 / 72 |
+| DK64 1cyc | 44-56 clk | −15 to −20, −36 (w32) | 124 / 93 |
+| ares | −3 to +35 (about 0) | | |
+
+- The console is "**about 45 clk per triangle + the span table without the +15**", ares is "fixed cost about 0 + span +15". For an ordinary triangle of
+  8-15 spans the totals agree (why the game lists matched in v15/v22); lists with many small triangles come out cheap in ares, tall triangles dear.
+  This is v22 W's conclusion again (fixed 45, no penalty); applying it to the game lists then came out 10-20% too cheap and still does (the games'
+  triangles carry a content-dependent +10-20% the synthetic ones do not: v23/v24/v28). Switching to the synthetically correct structure would break
+  the games, so **the structure of the triangle cost is left as it is**.
+- The command-word fixed cost exists in the depth modes too (edges only 09: 88.5 → 0F: 116; ares 69 → 72).
+- Spans whose depth test fails as a whole are 27-54 clk cheaper on the console (as v24). ares' estimator returns a pass rate of 1 on the synthetic
+  frames and comes out higher instead; in the games it estimates from the previous frame's overdraw, a separate matter.
+- MGC part 5's 1CYC16_BLEND (640 wide): one-span triangle console 73 / ares 49, and ares 6-8 clk/span too high from 8 spans up — the −4.5% of part 5.
+
+### v34: rectangles (R) and texture loads (L)
+- Rectangles (1x1-128x128, 1024 each, random positions, console/ares): write-only Fill / Texture 1- and 2-cycle / Copy / Flip are **within ±5%** from
+  4x4 up (1x1 alone +18-40%: a missing fixed cost); Load_Tile / Sync_Pipe / Set_Tile per rectangle also ±5%. **Rectangles with IMAGE_READ + blend are
+  10-20% too dear in ares, with primitive depth 25-35%** (their spans use the triangle table + 15); 640-wide fills are 5-15% too cheap. BAR's
+  crash-scene rectangles were 1-9% dearer on the console in v15, the opposite direction, so no depth/blend rectangle correction is applied
+  (rectangles have a content-dependent difference too).
+- Loads (512 each, `hw/v34b`-`v34d`): Load_Tile (RGBA16 8x8-64x32, RGBA32, I8, CI8, CI4), Load_Block (every format), Load_TLUT 16 / 256,
+  interleaved with drawing, without Sync_Tile — **all console/ares 1.00-1.03**. The only systematic difference is the **source row stride**: the same
+  32x32 RGBA16 tile out of a 320-pixel-wide image (640 B rows) +4.8%, out of a 640-pixel-wide one (1280 B) +8.5% (+1.2 / +2.3 clk per row).
+  DK64's +6-7% is explained by this (partial loads out of wide images).
+- Load_Tile / Load_Block of 4-bit textures **hang the RDP on the console** when the tile and the image are declared 4-bit (v23's ci4_tlut, three
+  times in v34/v34b/v34c). Declared as libultra's `_4b` macros do (Load_Tile: an 8-bit image/tile of half the width, Load_Block: a 16-bit image of
+  width 1) they work and cost the same as 8-bit.
+
+### v35: where the colour and depth buffers sit in RDRAM
+| depth-tested spans (console, relative to another megabyte) | width 4 | 13 | 32 | 64 |
+|---|---|---|---|---|
+| BAR 2cyc, colour and depth in the same megabyte (150K-768K apart or depth below: identical) | ×1.10 | ×1.17 | ×1.165 | ×1.165 |
+| DK64 1cyc, same megabyte | ×1.10 | ×1.16 | ×1.20 | ×1.20 |
+| colour straddling a megabyte boundary (partly the same megabyte) | ×1.01-1.02 | | | |
+| 640 wide, same megabyte | ×1.05 | ×1.11 | ×1.13 | ×1.175 |
+| blend only (no depth) / write-only / texture source in the same megabyte | ×1.00 / ×1.00 / ×1.01 | | | |
+
+Inside the megabyte the distance does not matter; what counts is whether the depth and colour read-modify-writes hit the same 1 MiB bank.
+
+### The fix (patch 0014: `n64: depth buffer in the colour buffer's megabyte, Load_Tile source stride`)
+1. Set_Mask_Image is parsed; a depth-tested span whose depth row and colour row are in the same megabyte costs **×1.10 (up to 8 px) / ×1.165 (2-cycle)
+   / ×1.20 (1-cycle)** (`sameBankNarrow` / `sameBank2` / `sameBank1` in `rdp.hpp`). DK64 / BAR / MGC use different megabytes: unchanged. Many 4 MiB
+   games are affected.
+2. Load_Tile rows whose source stride is 512 B or more cost +1.2 clk each, 1024 B or more +2.3 (`loadStride` / `loadStrideWide`).
+The 640-wide fill's +5-15% hit DK64's depth clear (it fills the depth buffer as a 640-wide image) and worsened its score 29 → 33, so it is left out.
+Series v10 row of the results table: DK64 29 (24/423/53), BAR 251/331, MGC RETRO logo at 8950 — as v9. Harness knobs `T_BANKN` / `T_BANK1` /
+`T_BANK2` / `T_LDSTRIDE` / `T_LDSTRIDEW`.
+
+## Test ROMs v36-v38: eliminating the candidate reasons for the games' triangles costing more than synthetic ones (added 2026-11-09)
+
+The "game lists' triangles are 10-20% dearer than synthetic triangles with the same span statistics" of v22 (v33's structure: the console is
+about 45 clk per triangle + spans cheaper than the tables, ares is fixed cost about 0 + spans +15; the totals agree for ordinary triangles) was
+attacked with three ROMs covering what the synthetic frames had not measured (NTSC, `hw/v36_*`-`hw/v38_*`, `rdp_timing/v36`-`v38`, ares = series v10).
+
+### v36: one property at a time on synthetic triangles (BAR 2-cycle, 8 spans, widths 4 / 13 / 32 / 64)
+| change | console (base 709 / 933 / 1347 / 1905 clk/triangle) | ares model |
+|---|---|---|
+| buffers off the 2 KB page (DK64's +576 B / +1536 B, +1 KB, +64 B) | all five **identical** (±0.1%) | no effect (same) |
+| texture axes rotated 90° / 45°, 4 texels/px along T | **identical** (±0.1%) | no effect (same) |
+| entirely right of the scissor (offscreen) | **88 clk** (2cyc) / **130** (DK64 1cyc) / 88 (write-only) | 0 / 10 / 51 |
+| zero area (8 rows of width 0) | **436 clk** = about 44 per row + about 45 fixed | 0 |
+| edges slanted 8 px per row (shear8) | **+19% / +13% / +8% / +5%** ≈ the span cost at width +6 px | −3 to −5% (centre-line width) |
+| right half / left half outside the scissor | right: 795 at w4 (same as an unclipped one), 1163 at w64; left: 407 / 1674 — **asymmetric** | both equal (visible width only) |
+| lower half of the rows outside | 0.83-0.96 × the four visible rows (the clipped rows are free) | free |
+
+- Rows outside the scissor and zero-width rows are not free on the console (about 44 clk per row, 88-130 per triangle). Counted in the game lists,
+  though, even where 33-43% of the rows (BAR's light frames) or 31% (DK64 d6373) lie outside the scissor, it comes to **1-2%** of the clocks, not 10-20%.
+- The union of the four sub-scanlines' extents (shear8's +6 px) is how the rasterizer works (`T_WIDEN`); on the game lists it moves every list
+  uniformly by −1 to −3% and does not narrow the differences between lists (not adopted).
+
+### v37: the games' lists with only the triangle shapes changed (console / ares v10, VI off)
+| list | full | tri_vert (vertical edges) | halfslope (slopes halved) | snap (whole pixels) | nosmall (rows < 4 removed) | onlysmall | shrink (half size) |
+|---|---|---|---|---|---|---|---|
+| bar_2316 | 1.036 | 0.96 | 0.99 | 1.03 | 1.00 | 1.01 | **1.06** |
+| bar_i2274 | 1.054 | 1.01 | 0.995 | 1.05 | 1.04 | 1.06 | **1.08** |
+| bar_i2314 | 0.988 | 0.95 | 0.945 | 0.99 | 0.97 | 1.03 | 1.035 |
+| dk64_797 | 1.004 | 0.96 | 0.955 | 0.99 | 0.95 | 1.09 | **1.12** |
+| dk64_d6373 | 0.960 | 0.97 | 0.965 | 0.96 | 0.96 | 1.07 | 1.00 |
+| mgc_p4_4316 | 1.072 | 1.06 | 1.05 | 1.07 | 1.07 | 1.01 | 0.96 |
+| mgc_p2_1802 | 0.984 | 0.985 | 0.98 | 0.98 | 0.98 | 1.03 | 1.00 |
+
+- Vertical edges, halved slopes and snapping move the console's cost by ±5% at most, and ares by about the same; the pattern of the per-list
+  differences does not change.
+- `tri_dblslope` (slopes doubled) makes triangles whose edges cross; ares draws the crossed spans with left and right swapped, the console draws
+  nothing (the model alone grows to 1.06-1.34). Not a valid probe, so it is left out of the table.
+- The only variant consistently on the console's side is `tri_shrink` (the smaller the triangles, the relatively dearer the console: 1.06-1.12 for
+  BAR / dk64_797) = v33's per-triangle fixed cost.
+
+### v38: the games' lists with only the drawing order changed (console / ares v10, VI off)
+Runs of consecutive triangles between state commands were reversed (reverse), split into even then odd (interleave), sorted by top row (sorty),
+and thinned to the first half / second half / every other triangle (every2: the overlap between neighbours mostly disappears).
+
+| list | full | reverse | interleave | sorty | firsthalf | secondhalf | every2 |
+|---|---|---|---|---|---|---|---|
+| bar_2316 | 1.036 | 1.007* | 1.009* | 1.007* | 1.009 | 1.032 | 1.004 |
+| bar_i2274 | 1.053 | 1.055 | 1.054 | 1.054 | 1.053 | 1.038 | 1.047 |
+| bar_i2314 | 0.988 | 0.985 | 0.988 | 0.986 | 0.988 | 1.005 | 0.981 |
+| dk64_797 | 1.003 | 1.004 | 1.004 | 1.002 | 1.018 | 1.017 | 1.017 |
+| dk64_d6373 | 0.960 | 0.960 | 0.960 | 0.960 | 0.962 | 0.990 | 0.969 |
+| mgc_p4_4316 | 1.072 | 1.072 | 1.072 | 1.072 | 1.096 | 1.031 | 1.066 |
+| mgc_p2_1802 | 0.984 | 0.983 | 0.983 | 0.983 | 0.987 | 0.991 | 0.979 |
+
+- The console is **the same within ±0.3%** whatever the order inside a run (all seven lists): there is no cost from neighbouring triangles
+  touching the same pixels or the same RDRAM rows. The halves and every-other variants move the console and ares by the same ratios (every2's
+  triangle part: console 0.55-0.62, ares 0.55-0.62).
+- *ares alone moves +2.7% on bar_2316's reorderings because its depth pass-rate estimate changes with the order; the console does not move, so that
+  much is noise in ares' pass-rate estimate.
+
+### Conclusion
+v36-v38 rule out placement, texture orientation, rows outside the scissor, zero-width rows, edge slope, snapping, size class, drawing order and
+adjacency as the reason the games' triangles cost more than synthetic ones. The per-list residuals (MGC p4 +7%, BAR i2274 +5%, DK64 d6373 −4%) are
+neither a property of individual triangles nor of their arrangement: they are constants over a whole list. What remains is v33's split between fixed
+cost and span cost, which was re-examined against all of the v33, v37 and v38 console data with the harness knobs `T_TRIOV` (fixed cost per triangle)
+and `T_TRISP` (added per triangle span, replacing the default spanPenalty of 15):
+
+| fixed / per span (harness) | game lists (the 7 lists of v37 + v38, every variant: geometric mean of console/ares, spread) | synthetic (v33, 8 spans, console/ares) | one-span triangles (v33 h1) |
+|---|---|---|---|
+| 0 / +15 (series v10, current) | 1.01, σ 4.5% (full 0.96-1.07, shrink 1.03-1.12) | 0.88-0.93 (BAR), 0.88 (DK) | 1.25-1.6 (0F), 1.3 (09) |
+| 45 / +3 (the synthetic structure of v22/v33) | **1.05, σ 4%** (full 1.01-1.12, shrink 1.04-1.10) | **0.93-0.95 / 0.90** | **0.95-1.0**, 09: 0.75 |
+| 45 / +8 | 1.01, σ 3.9% (full 0.97-1.07, shrink 1.00-1.07) | 0.89-0.91 / 0.86 | 0.9-0.95 |
+| 30 / +10 | 1.01, σ 3.9% | 0.89-0.91 / 0.86 | 1.0 |
+
+- The split that fits the synthetic frames (45 / +3) fixes the one-span triangles (1.25-1.6 → 0.95-1.0) but puts **the game lists
+  uniformly +5% off** (+12% for BAR 2316), and the split that fits the games leaves the synthetic 8-span triangles 10-14% too dear:
+  the conflict of v22 stands. The fixed cost would also have to follow the command words (09 → 18, 0D → 30, 0F → 45, as 0013 does), which
+  does not fill the games' +5-12% either. **The re-split of the tables (the 0015 candidate) is on hold**; the series stays at v10.
+- What still differs between the synthetic frames and the games is **how the depth test fails**. The synthetic frames only measured "every pixel
+  passes" and "every pixel fails" (the latter 27-54 clk/span cheaper), and ares blends the two tables linearly by the pass rate. In the games
+  it is normal for only some of a span's pixels to fail (overdraw); if the console treats such a span like a passing one (memory traffic per
+  block), the −10 clk/span ≈ 10% that ares subtracts at its estimated pass rate of about 0.7 is exactly the games' excess. The 2.7% that ares
+  alone moved on bar_2316's reorderings in v38 comes from the same estimator. ROM v39 measures this (`rdp_timing/v39`: the depth buffer preset
+  near on every 1 / 2 / 4 / 8 / 16 / 32 columns, every other row, random 25 / 50 / 75% of the pixels; BAR 2-cycle / DK64 1-cycle, widths 4-64).
+
+The harness knob `T_WIDEN=1|2` (sub-scanline union) is in 9999.
+
+## Changes (patches 0001 to 0014, harness 9999)
 
 (`0001` is an independent bug fix: in `ares/n64/rdp/io.cpp` `RDP::readWord`, the DPC_TMEM_BUSY check was written as `if(data == 7)`, a typo that made the
 TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
@@ -822,9 +969,9 @@ TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
 Files changed by `0002` (the RDP model): `ares/n64/rdp/timing.cpp` (new), `ares/n64/rdp/timing-model.hpp` (new, the console-measured table),
 `rdp.hpp`, `rdp.cpp`, `render.cpp`, `io.cpp`, `serialization.cpp`, `vulkan/vulkan.cpp`, `system/serialization.cpp` (state version v154),
 `n64/CMakeLists.txt`. Files changed by `0003` (CPU stalls): `ares/n64/cpu/cpu.hpp`, `cpu.cpp`, `dcache.cpp`, `recompiler.cpp`.
-All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0013 with `git am`, 9999 with `git apply --check`).
+All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0014 with `git am`, 9999 with `git apply --check`).
 `0012` is the model from the v24/v25/v28 sections (Z makes the whole span fail only for spans of 16 px or less, ATOMIC_PRIM at 20 clk/primitive, 1-cycle AA at 3.5 clk/span,
-and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), `0013` is the model of the MGC 2011 section (write-only span / triangle costs), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
+and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), `0013` is the model of the MGC 2011 section (write-only span / triangle costs), `0014` the model of the v33-v35 section (colour/depth in the same megabyte, Load_Tile source stride), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
 `0007` is the PI timing fix that gets past the MGC 2011 demo's emulator detection (`n64: make cartridge ROM ignore PI accesses faster than a mask ROM can serve`, in `cartridge.hpp` and `pi/device.hpp`), `0008`/`0009` are the models from the v17 to v19 sections above, `0010` is the v20 section's, and `0011` is the v20b section's.
 
 1. **RDP execution time model** (`timing.cpp` + `timing-model.hpp`)
@@ -872,16 +1019,22 @@ git am 0010-n64-DPC_CURRENT-follows-the-modelled-RDP-progress-so.patch   # v20: 
 git am 0011-n64-SP-DMA-and-CPU-bus-contention-against-the-RDP-re.patch   # v20b: re-measurement of the time SP DMA / CPU fills take from the RDP
 git am 0012-n64-depth-test-savings-only-for-short-spans-ATOMIC_P.patch   # v24/v25/v28: depth-test savings only for spans up to 16 px, ATOMIC_PRIM, 1-cycle AA
 git am 0013-n64-write-only-spans-and-triangles-cost-more-on-the-.patch   # v29-v32: write-only span / triangle costs (MGC 2011)
+git am 0014-n64-depth-buffer-in-the-colour-buffer-s-megabyte-Loa.patch   # v34/v35: colour/depth in the same megabyte, Load_Tile source stride
 # Build as usual (cmake -B build && cmake --build build)
 ```
 
-`9999` is the headless verification harness (`headless/`, plus counting, dumping and environment-variable knobs on the core side), and is not meant for upstream (apply it on top of 0012 with `git apply`).
+`9999` is the headless verification harness (`headless/`, plus counting, dumping and environment-variable knobs on the core side), and is not meant for upstream (apply it on top of 0014 with `git apply`).
 It removes the GUI (hiro/desktop-ui) from the top-level CMake and links only the N64 core, and
 `headless <rom> <number of VI frames> --watch ADDR[:fmt] --save/--load/--poke ...` lets you observe RAM
 (it is for analysis in a Linux environment without a GUI).
 
 ## Caveats and remaining issues
 
+- (added 2026-11-09) The **games' triangles costing 5-12% more than synthetic ones**: v36-v38 rule out placement, texture orientation, rows
+  outside the scissor, zero-width rows, edge slope, snapping, size class, drawing order and adjacency (the excess is a constant over each list).
+  The remaining candidate is how the depth test fails partially (the cost of a span of which only some pixels fail; ares blends its pass/fail
+  tables linearly), measured by v39 (`rdp_timing/v39`). The re-split of fixed cost / span cost (the 0015 candidate) is on hold because the
+  synthetic frames and the games still disagree.
 - (added 2026-11-01, overall status) **The DK64 demo is within 1 to 2% of the console with series v7/v8** (dk64_tasklog: RDP-bound frames −1%, CPU-bound frames +2%,
   total +0.8%, and the PI DMA speed is the same). **The BAR intro is still at seg0 249 vs 230 frames (ares is 8% faster)**, and the remainder is
   (1) the part that only appears in-game (RSP DMA contention, FIFO coupling, CPU contention, together +2 to +4%), and (2) **the ±10 to 15% "scene content" dependence of the triangle cost**

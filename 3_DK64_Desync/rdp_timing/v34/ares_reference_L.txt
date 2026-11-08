@@ -1,0 +1,42 @@
+X  mgc_p4_4316.bin  full
+X  mgc_p4_4316.bin  full  vi_off
+X  mgc_p4_4316.bin  full  game
+X  mgc_p4_4316.bin  tri_only
+X  mgc_p4_4316.bin  tri_only  vi_off
+X  mgc_p4_4316.bin  tri_only  game
+# rdp_timing v25 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E2440; dma buffer at 0x7D0000; heap top 0x0E4000; display buffer at 0x04BCC0; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	167
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1315851	1004177	1181238	0	640	92314
+X	mgc_p4_4316.bin	full	game	1348417	1029030	1181238	3242	1280	92267
+X	mgc_p4_4316.bin	tri_only	vi_off	1215284	927428	1181238	0	640	92315
+X	mgc_p4_4316.bin	tri_only	game	1244829	949976	1181238	3242	1280	92267
+# L lines: case, kind, texels, bytes, loads, clock (smallest of 3), ticks, clocks/load, clocks/byte, VI probe. VI off. Every load: Sync_Load, Set_Tile 7, Load_* , Sync_Tile (nosync: no Sync_Tile); *_draw: a 4x4 write-only shade triangle after every load; *_srcN: the texture image is N texels wide
+L	tile_rgba16_32x32_src320	tile	1024	2048	512	559527	426984	1092.83	0.534	92314
+L	tile_rgba16_32x32_src640	tile	1024	2048	512	559527	426984	1092.83	0.534	92315
+L	tile_rgba16_8x8_src320	tile	64	128	512	139514	106447	272.49	2.129	92267
+L	block_rgba16_8x8	block	64	128	512	65527	49984	127.98	1.000	92266
+L	block_rgba16_32x32	block	1024	2048	512	466750	356181	911.62	0.445	92266
+L	block_rgba16_64x32	block	2048	4096	512	894725	682793	1747.51	0.427	92267
+L	block_ci8_64x32	block	2048	2048	512	466750	356181	911.62	0.445	92266
+L	block_rgba32_32x16	block	512	2048	512	466750	356181	911.62	0.445	92267
+L	tile_rgba16_32x32_draw	tile	1024	2048	512	608851	464626	1189.16	0.581	92266
+L	block_ci8_64x32_draw	block	2048	2048	512	516093	393837	1007.99	0.492	92266
+L	tile_rgba16_32x32_nosync	tile	1024	2048	512	542922	414311	1060.39	0.518	92267
+L	tlut_16	tlut	16	32	512	80974	61773	158.15	4.942	92267
+L	tlut_256	tlut	256	512	512	209110	159561	408.42	0.798	92267
+L	tlut_256_draw	tlut	256	512	512	258453	197217	504.79	0.986	92266
+L	block_ci4_64x32	block	2048	1024	512	252773	192882	493.70	0.482	92266
+L	tile_ci4_64x32	tile	2048	1024	512	484801	369955	946.88	0.925	92267

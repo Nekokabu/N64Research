@@ -1,0 +1,252 @@
+X  bar_2316.bin  full
+X  bar_2316.bin  full  vi_off
+X  bar_2316.bin  full  game
+X  bar_2316.bin  tri_only
+X  bar_2316.bin  tri_only  vi_off
+X  bar_2316.bin  tri_only  game
+X  bar_2316.bin  tri_vert
+X  bar_2316.bin  tri_vert  vi_off
+X  bar_2316.bin  tri_vert  game
+X  bar_2316.bin  tri_halfslope
+X  bar_2316.bin  tri_halfslope  vi_off
+X  bar_2316.bin  tri_dblslope
+X  bar_2316.bin  tri_dblslope  vi_off
+X  bar_2316.bin  tri_snap
+X  bar_2316.bin  tri_snap  vi_off
+X  bar_2316.bin  tri_nosmall
+X  bar_2316.bin  tri_nosmall  vi_off
+X  bar_2316.bin  tri_onlysmall
+X  bar_2316.bin  tri_onlysmall  vi_off
+X  bar_2316.bin  tri_shrink
+X  bar_2316.bin  tri_shrink  vi_off
+X  bar_i2274.bin  full
+X  bar_i2274.bin  full  vi_off
+X  bar_i2274.bin  full  game
+X  bar_i2274.bin  tri_only
+X  bar_i2274.bin  tri_only  vi_off
+X  bar_i2274.bin  tri_only  game
+X  bar_i2274.bin  tri_vert
+X  bar_i2274.bin  tri_vert  vi_off
+X  bar_i2274.bin  tri_vert  game
+X  bar_i2274.bin  tri_halfslope
+X  bar_i2274.bin  tri_halfslope  vi_off
+X  bar_i2274.bin  tri_dblslope
+X  bar_i2274.bin  tri_dblslope  vi_off
+X  bar_i2274.bin  tri_snap
+X  bar_i2274.bin  tri_snap  vi_off
+X  bar_i2274.bin  tri_nosmall
+X  bar_i2274.bin  tri_nosmall  vi_off
+X  bar_i2274.bin  tri_onlysmall
+X  bar_i2274.bin  tri_onlysmall  vi_off
+X  bar_i2274.bin  tri_shrink
+X  bar_i2274.bin  tri_shrink  vi_off
+X  bar_i2314.bin  full
+X  bar_i2314.bin  full  vi_off
+X  bar_i2314.bin  full  game
+X  bar_i2314.bin  tri_only
+X  bar_i2314.bin  tri_only  vi_off
+X  bar_i2314.bin  tri_only  game
+X  bar_i2314.bin  tri_vert
+X  bar_i2314.bin  tri_vert  vi_off
+X  bar_i2314.bin  tri_vert  game
+X  bar_i2314.bin  tri_halfslope
+X  bar_i2314.bin  tri_halfslope  vi_off
+X  bar_i2314.bin  tri_dblslope
+X  bar_i2314.bin  tri_dblslope  vi_off
+X  bar_i2314.bin  tri_snap
+X  bar_i2314.bin  tri_snap  vi_off
+X  bar_i2314.bin  tri_nosmall
+X  bar_i2314.bin  tri_nosmall  vi_off
+X  bar_i2314.bin  tri_onlysmall
+X  bar_i2314.bin  tri_onlysmall  vi_off
+X  bar_i2314.bin  tri_shrink
+X  bar_i2314.bin  tri_shrink  vi_off
+X  dk64_797.bin  full
+X  dk64_797.bin  full  vi_off
+X  dk64_797.bin  full  game
+X  dk64_797.bin  tri_only
+X  dk64_797.bin  tri_only  vi_off
+X  dk64_797.bin  tri_only  game
+X  dk64_797.bin  tri_vert
+X  dk64_797.bin  tri_vert  vi_off
+X  dk64_797.bin  tri_vert  game
+X  dk64_797.bin  tri_halfslope
+X  dk64_797.bin  tri_halfslope  vi_off
+X  dk64_797.bin  tri_dblslope
+X  dk64_797.bin  tri_dblslope  vi_off
+X  dk64_797.bin  tri_snap
+X  dk64_797.bin  tri_snap  vi_off
+X  dk64_797.bin  tri_nosmall
+X  dk64_797.bin  tri_nosmall  vi_off
+X  dk64_797.bin  tri_onlysmall
+X  dk64_797.bin  tri_onlysmall  vi_off
+X  dk64_797.bin  tri_shrink
+X  dk64_797.bin  tri_shrink  vi_off
+X  dk64_d6373.bin  full
+X  dk64_d6373.bin  full  vi_off
+X  dk64_d6373.bin  full  game
+X  dk64_d6373.bin  tri_only
+X  dk64_d6373.bin  tri_only  vi_off
+X  dk64_d6373.bin  tri_only  game
+X  dk64_d6373.bin  tri_vert
+X  dk64_d6373.bin  tri_vert  vi_off
+X  dk64_d6373.bin  tri_vert  game
+X  dk64_d6373.bin  tri_halfslope
+X  dk64_d6373.bin  tri_halfslope  vi_off
+X  dk64_d6373.bin  tri_dblslope
+X  dk64_d6373.bin  tri_dblslope  vi_off
+X  dk64_d6373.bin  tri_snap
+X  dk64_d6373.bin  tri_snap  vi_off
+X  dk64_d6373.bin  tri_nosmall
+X  dk64_d6373.bin  tri_nosmall  vi_off
+X  dk64_d6373.bin  tri_onlysmall
+X  dk64_d6373.bin  tri_onlysmall  vi_off
+X  dk64_d6373.bin  tri_shrink
+X  dk64_d6373.bin  tri_shrink  vi_off
+X  mgc_p4_4316.bin  full
+X  mgc_p4_4316.bin  full  vi_off
+X  mgc_p4_4316.bin  full  game
+X  mgc_p4_4316.bin  tri_only
+X  mgc_p4_4316.bin  tri_only  vi_off
+X  mgc_p4_4316.bin  tri_only  game
+X  mgc_p4_4316.bin  tri_vert
+X  mgc_p4_4316.bin  tri_vert  vi_off
+X  mgc_p4_4316.bin  tri_vert  game
+X  mgc_p4_4316.bin  tri_halfslope
+X  mgc_p4_4316.bin  tri_halfslope  vi_off
+X  mgc_p4_4316.bin  tri_dblslope
+X  mgc_p4_4316.bin  tri_dblslope  vi_off
+X  mgc_p4_4316.bin  tri_snap
+X  mgc_p4_4316.bin  tri_snap  vi_off
+X  mgc_p4_4316.bin  tri_nosmall
+X  mgc_p4_4316.bin  tri_nosmall  vi_off
+X  mgc_p4_4316.bin  tri_onlysmall
+X  mgc_p4_4316.bin  tri_onlysmall  vi_off
+X  mgc_p4_4316.bin  tri_shrink
+X  mgc_p4_4316.bin  tri_shrink  vi_off
+X  mgc_p2_1802.bin  full
+X  mgc_p2_1802.bin  full  vi_off
+X  mgc_p2_1802.bin  full  game
+X  mgc_p2_1802.bin  tri_only
+X  mgc_p2_1802.bin  tri_only  vi_off
+X  mgc_p2_1802.bin  tri_only  game
+X  mgc_p2_1802.bin  tri_vert
+X  mgc_p2_1802.bin  tri_vert  vi_off
+X  mgc_p2_1802.bin  tri_vert  game
+X  mgc_p2_1802.bin  tri_halfslope
+X  mgc_p2_1802.bin  tri_halfslope  vi_off
+X  mgc_p2_1802.bin  tri_dblslope
+X  mgc_p2_1802.bin  tri_dblslope  vi_off
+X  mgc_p2_1802.bin  tri_snap
+X  mgc_p2_1802.bin  tri_snap  vi_off
+X  mgc_p2_1802.bin  tri_nosmall
+X  mgc_p2_1802.bin  tri_nosmall  vi_off
+X  mgc_p2_1802.bin  tri_onlysmall
+X  mgc_p2_1802.bin  tri_onlysmall  vi_off
+X  mgc_p2_1802.bin  tri_shrink
+X  mgc_p2_1802.bin  tri_shrink  vi_off
+# rdp_timing v25 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E1CC0; dma buffer at 0x7D0000; heap top 0x0E4000; display buffer at 0x04B540; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	167
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	bar_2316.bin	list 174952 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_2316.bin	full	vi_off	1352449	1032033	1237577	0	640	92314
+X	bar_2316.bin	full	game	1528831	1166688	1237577	3012	320	104616
+X	bar_2316.bin	tri_only	vi_off	1198781	914810	1237577	0	640	92314
+X	bar_2316.bin	tri_only	game	1316601	1004723	1237577	3012	320	104616
+X	bar_2316.bin	tri_vert	vi_off	1397198	1066234	1237577	0	640	92315
+X	bar_2316.bin	tri_vert	game	1538673	1174199	1237577	3012	320	104616
+X	bar_2316.bin	tri_halfslope	vi_off	1394407	1064078	1237577	0	640	92314
+X	bar_2316.bin	tri_dblslope	vi_off	1506163	1149391	1237577	0	640	92314
+X	bar_2316.bin	tri_snap	vi_off	1359314	1037296	1237577	0	640	92315
+X	bar_2316.bin	tri_nosmall	vi_off	1365527	1042038	1237577	0	640	92314
+X	bar_2316.bin	tri_onlysmall	vi_off	306733	234011	1237577	0	640	92314
+X	bar_2316.bin	tri_shrink	vi_off	711146	542668	1237577	0	640	92314
+XI	bar_i2274.bin	list 64512 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_i2274.bin	full	vi_off	509366	388678	571596	0	640	92314
+X	bar_i2274.bin	full	game	563138	429710	571596	3012	320	104615
+X	bar_i2274.bin	tri_only	vi_off	343516	262108	571596	0	640	92315
+X	bar_i2274.bin	tri_only	game	377849	288306	571596	3012	320	104615
+X	bar_i2274.bin	tri_vert	vi_off	526257	401568	571596	0	640	92314
+X	bar_i2274.bin	tri_vert	game	582004	444109	571596	3012	320	104616
+X	bar_i2274.bin	tri_halfslope	vi_off	497282	379456	571596	0	640	92315
+X	bar_i2274.bin	tri_dblslope	vi_off	576113	439617	571596	0	640	92315
+X	bar_i2274.bin	tri_snap	vi_off	508967	388373	571596	0	640	92314
+X	bar_i2274.bin	tri_nosmall	vi_off	502583	383501	571596	0	640	92314
+X	bar_i2274.bin	tri_onlysmall	vi_off	229762	175296	571596	0	640	92314
+X	bar_i2274.bin	tri_shrink	vi_off	316478	241474	571596	0	640	92315
+XI	bar_i2314.bin	list 170608 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_i2314.bin	full	vi_off	1400904	1069061	1564545	0	640	92314
+X	bar_i2314.bin	full	game	1542227	1176910	1564545	3012	320	104616
+X	bar_i2314.bin	tri_only	vi_off	1212613	925367	1564545	0	640	92315
+X	bar_i2314.bin	tri_only	game	1331877	1016381	1564545	3012	320	104616
+X	bar_i2314.bin	tri_vert	vi_off	1422943	1085882	1564545	0	640	92315
+X	bar_i2314.bin	tri_vert	game	1566869	1195717	1564545	3012	320	104616
+X	bar_i2314.bin	tri_halfslope	vi_off	1401322	1069356	1564545	0	640	92315
+X	bar_i2314.bin	tri_dblslope	vi_off	1495903	1141561	1564545	0	640	92314
+X	bar_i2314.bin	tri_snap	vi_off	1374723	1049056	1564545	0	640	92314
+X	bar_i2314.bin	tri_nosmall	vi_off	1379035	1052347	1564545	0	640	92315
+X	bar_i2314.bin	tri_onlysmall	vi_off	302305	230632	1564545	0	640	92315
+X	bar_i2314.bin	tri_shrink	vi_off	739950	564650	1564545	0	640	92315
+XI	dk64_797.bin	list 350424 B, prefix 20, z 5D2E00+153600, regions 01D240-5F8600, offset +100000
+X	dk64_797.bin	full	vi_off	1189718	907894	1012163	0	640	92314
+X	dk64_797.bin	full	game	1303434	994674	1012163	3016	320	104615
+X	dk64_797.bin	tri_only	vi_off	980319	748090	1012163	0	640	92315
+X	dk64_797.bin	tri_only	game	1069469	816121	1012163	3016	320	104616
+X	dk64_797.bin	tri_vert	vi_off	1201460	916855	1012163	0	640	92315
+X	dk64_797.bin	tri_vert	game	1316335	1004520	1012163	3016	320	104616
+X	dk64_797.bin	tri_halfslope	vi_off	1190535	908518	1012163	0	640	92315
+X	dk64_797.bin	tri_dblslope	vi_off	1259391	961065	1012163	0	640	92314
+X	dk64_797.bin	tri_snap	vi_off	1190194	908257	1012163	0	640	92315
+X	dk64_797.bin	tri_nosmall	vi_off	1089778	831624	1012163	0	640	92315
+X	dk64_797.bin	tri_onlysmall	vi_off	501044	382327	1012163	0	640	92314
+X	dk64_797.bin	tri_shrink	vi_off	719069	548715	1012163	0	640	92315
+XI	dk64_d6373.bin	list 246984 B, prefix 22, z 5D2E00+153600, regions 01D240-5F8600, offset +100000
+X	dk64_d6373.bin	full	vi_off	2162024	1649917	2362529	0	640	92314
+X	dk64_d6373.bin	full	game	2372184	1810299	2362529	3016	320	104616
+X	dk64_d6373.bin	tri_only	vi_off	1777218	1356249	2362529	0	640	92315
+X	dk64_d6373.bin	tri_only	game	1942271	1482207	2362529	3016	320	104615
+X	dk64_d6373.bin	tri_vert	vi_off	2174641	1659545	2362529	0	640	92315
+X	dk64_d6373.bin	tri_vert	game	2385902	1820768	2362529	3016	320	104616
+X	dk64_d6373.bin	tri_halfslope	vi_off	2156401	1645600	2362529	0	640	92315
+X	dk64_d6373.bin	tri_dblslope	vi_off	2313929	1765845	2362529	0	640	92315
+X	dk64_d6373.bin	tri_snap	vi_off	2110516	1610583	2362529	0	640	92314
+X	dk64_d6373.bin	tri_nosmall	vi_off	2130201	1625605	2362529	0	640	92315
+X	dk64_d6373.bin	tri_onlysmall	vi_off	607579	463604	2362529	0	640	92315
+X	dk64_d6373.bin	tri_shrink	vi_off	1267714	967417	2362529	0	640	92315
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1315897	1004188	1181238	0	640	92314
+X	mgc_p4_4316.bin	full	game	1348463	1029041	1181238	3242	1280	92314
+X	mgc_p4_4316.bin	tri_only	vi_off	1215330	927440	1181238	0	640	92315
+X	mgc_p4_4316.bin	tri_only	game	1244875	949988	1181238	3242	1280	92315
+X	mgc_p4_4316.bin	tri_vert	vi_off	1326803	1012511	1181238	0	640	92314
+X	mgc_p4_4316.bin	tri_vert	game	1359825	1037713	1181238	3242	1280	92315
+X	mgc_p4_4316.bin	tri_halfslope	vi_off	1320476	1007683	1181238	0	640	92314
+X	mgc_p4_4316.bin	tri_dblslope	vi_off	1763024	1345417	1181238	0	640	92315
+X	mgc_p4_4316.bin	tri_snap	vi_off	1315271	1003710	1181238	0	640	92315
+X	mgc_p4_4316.bin	tri_nosmall	vi_off	1304516	995503	1181238	0	640	92314
+X	mgc_p4_4316.bin	tri_onlysmall	vi_off	356227	271808	1181238	0	640	92314
+X	mgc_p4_4316.bin	tri_shrink	vi_off	740235	564867	1181238	0	640	92314
+XI	mgc_p2_1802.bin	list 239152 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p2_1802.bin	full	vi_off	2074321	1582985	2144538	0	640	92315
+X	mgc_p2_1802.bin	full	game	2126475	1622787	2144538	3242	1280	92314
+X	mgc_p2_1802.bin	tri_only	vi_off	1607566	1226778	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_only	game	1645661	1255851	2144538	3242	1280	92315
+X	mgc_p2_1802.bin	tri_vert	vi_off	2084219	1590540	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_vert	game	2136641	1630545	2144538	3242	1280	92315
+X	mgc_p2_1802.bin	tri_halfslope	vi_off	2087088	1592729	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_dblslope	vi_off	2398593	1830457	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_snap	vi_off	2075460	1583855	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_nosmall	vi_off	2068126	1578258	2144538	0	640	92315
+X	mgc_p2_1802.bin	tri_onlysmall	vi_off	709702	541566	2144538	0	640	92314
+X	mgc_p2_1802.bin	tri_shrink	vi_off	1245958	950814	2144538	0	640	92315
