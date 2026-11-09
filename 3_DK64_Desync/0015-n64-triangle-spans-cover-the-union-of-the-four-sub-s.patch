@@ -1,0 +1,47 @@
+From 65826ce79ff5f7dc2be036b2922529f60d32cc2f Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Mon, 9 Nov 2026 01:48:55 +0900
+Subject: [PATCH] n64: triangle spans cover the union of the four sub-scanlines
+ (rdp_timing v36)
+
+The RDP's edge walker evaluates the edges on four sub-scanlines per row and
+writes the span from the leftmost to the rightmost position among them. The
+timing model took the width at the row centre, so slanted edges came out too
+narrow: on the console a triangle whose edges move 8 px per row costs like one
+6 px wider (rdp_timing v36, +19/+13/+8/+5% at widths 4/13/32/64 against the
+model's -3..-5%). With the union the games' lists cost 1-3% more, which is where
+the MGC 2011 demo's parts 4 and 5 (640x480, long slanted edges) were short:
+-3.8/-3.5% -> -1.7/-2.0% against the console's task log, and the logo part of
+the demo now meets the music within 0.1 s. Donkey Kong 64 and Beetle Adventure
+Racing move by less than one frame per scene.
+---
+ ares/n64/rdp/timing.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 4c8b1a35..227fc6b1 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -256,6 +256,19 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     f64 xMinor = yc < fym ? fxm + fdxmdy * (yc - fyh) : fxl + fdxldy * (yc - fym);
+     f64 x0 = xMajor < xMinor ? xMajor : xMinor;
+     f64 x1 = xMajor < xMinor ? xMinor : xMajor;
++    //the RDP walks each row as four sub-scanlines and the span it writes runs from the leftmost to the
++    //rightmost edge position among them, so a slanted edge widens the span: on the console a triangle whose
++    //edges move 8 px per row costs like one 6 px wider (rdp_timing v36), and the games' lists come out
++    //1-3% dearer than the centre-line width says (v37/v38)
++    for(s32 k = 0; k < 4; k++) {
++      f64 ys = row + 0.125 + 0.25 * k;
++      if(ys < fyh || ys >= fyl) continue;
++      f64 a = fxh + fdxhdy * (ys - fyh);
++      f64 b = ys < fym ? fxm + fdxmdy * (ys - fyh) : fxl + fdxldy * (ys - fym);
++      if(a > b) { f64 t = a; a = b; b = t; }
++      if(a < x0) x0 = a;
++      if(b > x1) x1 = b;
++    }
+     if(x0 < timing.scissorX0) x0 = timing.scissorX0;
+     if(x1 > timing.scissorX1) x1 = timing.scissorX1;
+     if(x1 <= x0) continue;
+-- 
+2.43.0
+

@@ -316,6 +316,9 @@ Results (ares default recompiler, full run from power-on):
 | **0004 to 0012: Z whole-span fail only for spans of 16 px or less, ATOMIC_PRIM, 1-cycle AA (series v8)** | 29 | 24/423/53 | ○ | **249/331** | +641/+667 (harness) |
 | **0004 to 0013: write-only span / triangle costs (series v9, MGC 2011)** | 29 | 24/423/53 | ○ | **251/331** | +641/+667 (harness) |
 | **0004 to 0014: colour/depth in the same megabyte, Load_Tile source stride (series v10)** | 29 | 24/423/53 | ○ | **251/331** | +641/+667 (harness) |
+| **0004 to 0015: span width = union of the four sub-scanlines (series v11)** | 36 | 24/421/55 | ○ | **252/328** | +642/+666 (harness) |
+| **0004 to 0016: the VI slows read-modify-write spans only, AA0 ×1.14, AA2 grows with the line (series v12)** | 36 | 24/420/56 | ○ | **252/328** | +641/+667 (harness) |
+| **0004 to 0017: 0016 reverted (the VI had stopped during v40; series v13 behaves as v11)** | 36 | 24/421/55 | ○ | **252/328** | +642/+666 (harness) |
 
 - The DK64 demo is now the series closest to the console (per-block VI counts are within 1 to 2).
 - BAR's crash scene (RDP-bound) matches the console (68/74/66 vs 70/76/69 VI/30 frames).
@@ -326,6 +329,10 @@ Results (ares default recompiler, full run from power-on):
   The frame structure is the same in both the 8MB and 4MB console recordings, so the presence of the Expansion Pak is irrelevant.
 - MGC 2011 (Retroactive): against the console recording, demo start to the RETRO logo is about 9050 VI on the console and 8620 in ares v8 (−4.8%; part 4 −12%, part 5 −8%).
   Series v9 (0013) gives 8950 (−1.1%), per part −4.5% to +1.6% (the "MGC 2011" section below).
+  Against the console's task log directly (the "end of the MGC 2011 demo" section below) v10 is part 4 −3.8% / part 5 −3.5% / logo +0.8%, and the "@"
+  beside the RETRO logo (on the console it lands on the "clank" in the music) comes 129 VI (2.2 s) early. Series v11 (0015): −1.7% / −2.0% / +1.9%, the "@" +5 VI.
+  With the console logs of parts 1-3 (mgc_tasklog v2) all six parts are, in v12 (0016), +0.2 / +0.8 / +3.5 / −3.3 / −1.5 / +0.8%, +0.2% in total, the "@" −1 VI (section below).
+  0016 was reverted (0017, series v13) because v40 had been measured with the VI stopped: as v11, +0.2 / +0.9 / +2.4 / −1.7 / −2.0 / +1.9%, +0.2% in total, the "@" +5 VI.
 ## Hardware test ROMs v17 to v19 and the v4 model (added 2026-10-31)
 
 Up to v16, loads were measured one at a time. v17 to v19 measured **the interactions when loads are applied simultaneously**, plus the CPU
@@ -894,7 +901,8 @@ attacked with three ROMs covering what the synthetic frames had not measured (NT
 - Rows outside the scissor and zero-width rows are not free on the console (about 44 clk per row, 88-130 per triangle). Counted in the game lists,
   though, even where 33-43% of the rows (BAR's light frames) or 31% (DK64 d6373) lie outside the scissor, it comes to **1-2%** of the clocks, not 10-20%.
 - The union of the four sub-scanlines' extents (shear8's +6 px) is how the rasterizer works (`T_WIDEN`); on the game lists it moves every list
-  uniformly by −1 to −3% and does not narrow the differences between lists (not adopted).
+  uniformly by −1 to −3% and does not narrow the differences between lists. That amount is, however, exactly what MGC's parts 4 and 5 lacked, and
+  the comparison with the console's task log led to its adoption (the section below, patch 0015).
 
 ### v37: the games' lists with only the triangle shapes changed (console / ares v10, VI off)
 | list | full | tri_vert (vertical edges) | halfslope (slopes halved) | snap (whole pixels) | nosmall (rows < 4 removed) | onlysmall | shrink (half size) |
@@ -959,9 +967,196 @@ and `T_TRISP` (added per triangle span, replacing the default spanPenalty of 15)
   alone moved on bar_2316's reorderings in v38 comes from the same estimator. ROM v39 measures this (`rdp_timing/v39`: the depth buffer preset
   near on every 1 / 2 / 4 / 8 / 16 / 32 columns, every other row, random 25 / 50 / 75% of the pixels; BAR 2-cycle / DK64 1-cycle, widths 4-64).
 
-The harness knob `T_WIDEN=1|2` (sub-scanline union) is in 9999.
+The harness knob `T_WIDEN` (0: centre-line width = series v10, 1: the union = 0015's default, 2: whole pixels) is in 9999.
 
-## Changes (patches 0001 to 0014, harness 9999)
+## The end of the MGC 2011 demo (the "@" and the "clank"), v39, patch 0015 (added 2026-11-09)
+
+### Symptom and console
+An "@" appears beside the RETRO logo and a "clank" sounds with it. In the console recording (`MGC2011__2_.mp4`, 60 fps) **the "@" appears at
+156.70 s and fades at 158.3 s, and the spectrogram shows a harmonic percussive hit (the clank) at 156.7 s** — simultaneous on the console. The music
+runs in real time and the "@" is placed by frame count, so in ares the "@" comes early by however much parts 4 onwards run faster than the console.
+
+### Direct comparison with the console's task log (mgc_tasklog, start of part 4 to logo frame 2233)
+The console log of `mgc_tasklog` (`hw_001_frames.txt`, 2234 frames from VI 5764) was matched frame by frame with the log the same ROM writes in
+ares (`ares_v10_frames.txt` / `ares_v11_frames.txt`, cut out of a RAM dump; the part boundaries at frames 1217 / 1968 coincide, and the loading
+gaps of 6.25 / 15.7 VI agree within 0.2 VI, so the PI side is right):
+
+| | console | ares v10 | ares v11 (0015) |
+|---|---|---|---|
+| start of part 4 (the logger's VI number) | 5764 | 5751 (−13) | 5822 (+58) |
+| part 4 (frames 0-1216) | 1813 VI, dp-go 1.482 | 1744 (**−3.8%**), 1.424 | 1782 (**−1.7%**), 1.455 |
+| part 5 (1217-1967) | 1446 VI, dp-go 1.901 | 1396 (**−3.5%**), 1.835 | 1417 (**−2.0%**) |
+| RETRO logo (1968-2233) | 362 VI | 365 (+0.8%) | 369 (+1.9%) |
+| VI of frame 2233 (6 frames before the "@") | 9385 | 9256 (**−129 VI = 2.2 s early**) | 9390 (+5 VI) |
+
+The RSP (go→done) agrees within ±1%; the whole difference is the RDP (dp-go). Per 100 frames ares/console is 0.93-0.98 in part 4 and 0.95-0.99 in part 5.
+
+### v39: the cost of a span of which only some pixels fail the depth test
+The remaining difference between the synthetic frames and the games, "how the depth test fails", was measured (`hw/v39_*`, `rdp_timing/v39`:
+BAR 2-cycle / DK64 1-cycle, 8 spans, widths 4-64, the depth buffer preset in column / row / random patterns). The console's position between
+pass (0) and fail (1) at the same width:
+
+| pattern (failing pixels) | w4 | w8 | w13 | w32 | w64 |
+|---|---|---|---|---|---|
+| every other pixel (50%) | 0.06 | 0.05 | 0.04 | 0.02 | 0.03 |
+| random 50% / 25% / 75% | 0.13 / 0.03 / 0.40 | 0.09 / 0.03 / 0.26 | 0.09 / 0.03 / 0.24 | 0.04 / 0.01 / 0.13 | 0.05 / 0.02 / 0.14 |
+| blocks of 4 / 8 columns | 0.25 / 0.39 | 0.14 / 0.29 | 0.15 / 0.28 | 0.05 / 0.12 | 0.07 / 0.16 |
+| blocks of 16 / 32 columns / every other row (whole spans) | 0.47 / 0.46 / 0.47 | 0.46 / 0.46 / 0.48 | 0.52 / 0.47 / 0.50 | 0.45 / 0.50 / 0.50 | 0.54 / 0.58 / 0.49 |
+| random 8-pixel blocks 50% | 0.44 | 0.39 | 0.39 | 0.34 | 0.34 |
+
+DK64's 1-cycle mode behaves the same. **Pixels failing individually save the console almost nothing (2-13% of the way from pass); the saving appears
+only when 16 or more consecutive pixels fail (or the whole span does)**, and then it is linear (0.5). ares' "blend the pass and fail tables by the
+pass rate" is right if the rate is read as the fraction of spans that fail as a whole, and too cheap if it is a per-pixel rate. Turning every
+depth saving off in the replay harness (`T_ZPASS=1`) moves the game lists by only 0-3%, though, so this is not the main part of v37/v38's +5-12%
+against the synthetic frames. Re-counting the estimator in runs of 16 pixels needs the in-game depth distribution and is deferred.
+
+### The fix (patch 0015: `n64: triangle spans cover the union of the four sub-scanlines`)
+As v36's shear8 showed (edges moving 8 px per row cost like a span 6 px wider: console +19/+13/+8/+5%, ares −3 to −5%), each row's span width
+is now **the union of the four sub-scanlines' extents (row +0.125 / +0.375 / +0.625 / +0.875)** instead of the width at the row centre (the triangle
+row loop in `timing.cpp`; the set of rows drawn stays the centre-line one). v36's shear8 goes from console/ares 1.22 / 1.04 / 0.94 / 0.86 to
+0.97 / 0.92 / 0.87 / 0.81 (= the same ratios as the unslanted base). The 12 MGC lists (VI off): console/ares mean 1.025 → 1.005 (part 4 1.031 → 1.005,
+part 5 1.040 → 1.024); the game lists (v37/v38) 1.01 → 0.99 (BAR 1.01-1.03, DK64 0.95-0.97, MGC p4 1.046). Results-table row series v11: DK64 36
+(24/421/55: two more 3-VI frames), BAR 251/331 → 252/328, crash +642/+666 — all within one frame. MGC as in the table above (the "@" −129 VI → +5 VI).
+
+### What is left
+- Parts 4 and 5 are still −1.7 / −2.0% and the logo +1.9%. The "@" lands partly by cancellation against parts 1-3 (+58 VI in v11), so a **console log
+  of parts 1-3** is needed: the two ROMs of `mgc_tasklog/v2` (`hook_a`: from the first task, `hook_b`: from the part 2 → 3 gap) join up into a
+  timeline of the whole demo.
+- In the console recording the black between parts 1 and 2 lasts 102 frames (ares' loading gap is 34 VI); whether the load is slower or black is being
+  drawn, log a will tell.
+- The factor for MGC's VI mode (0x3242, VI_WIDTH 1280): in the console replay the part 4-6 lists show **no VI effect** (game/vi_off 1.000, and 1.000 for
+  everything on the PAL console), only the NTSC console's part 1-3 lists +3%; ares applies +2.5% to all of them → v40 / patch 0016 (next section).
+
+## Console logs of parts 1-3, the VI slowdown by span class (v40), patch 0016 (added 2026-11-09)
+
+### mgc_tasklog v2: the timeline of the whole demo
+The console logs of `hook_a` (from the first graphics task) and `hook_b` (from the part 2 → 3 gap) (`hw/mgc_tasklog_hw_a_96k.srm` / `_b_96k.srm`,
+`mgc_tasklog/hw_a_frames.txt` / `hw_b_frames.txt`), together with v1's parts 4-6, let the whole demo be matched to the console frame by frame
+(`mgc_tasklog/parts.py`, result `parts_v10_v11_v12.txt`). The part boundaries fall on the same frame numbers as in ares in all three logs
+(a: 1232, b: 1345, c: 1217 / 1968) and the loading gaps are the same length (a: 34 VI, b: 5 VI) — the 102 black frames of the console recording
+were a fade the demo draws, not loading.
+
+| segment (log: frames) | console VI | ares v10 | v11 (0015) | v12 (0016) |
+|---|---|---|---|---|
+| part 1 (a 0-1231) | 1413 | 1411 (−0.1%) | 1416 (+0.2%) | 1416 (+0.2%) |
+| part 2 (a 1232-2129, 82%) | 1814 | 1803 (−0.6%) | 1831 (+0.9%) | 1829 (+0.8%) |
+| part 3 (b 0-1344) | 2163 | 2183 (+0.9%) | 2215 (+2.4%) | **2238 (+3.5%)** |
+| part 4 (c 0-1216) | 1813 | 1744 (−3.8%) | 1782 (−1.7%) | **1753 (−3.3%)** |
+| part 5 (c 1217-1967) | 1446 | 1396 (−3.5%) | 1417 (−2.0%) | 1424 (−1.5%) |
+| RETRO logo (c 1968-2232) | 362 | 365 (+0.8%) | 369 (+1.9%) | 365 (+0.8%) |
+| total | 9011 | 8902 (−1.2%) | 9030 (+0.2%) | 9025 (+0.2%) |
+| VI just before the "@" (c 2233) | 9385 | 9256 (−129) | 9390 (+5) | 9384 (−1) |
+
+From the logo on (`hook_c`, `hw/mgc_tasklog_hw_c_96k.srm` / `mgc_tasklog/hw_c_frames.txt`, console VI 9021-11199, 1866 frames): the frame that
+shows the "@" (c 274 = v1's 2242) is at **console VI 9393, ares v12 9393 (±0)**; the whole logo (c 0-265) console 362 / ares 365. The fade of the MGC
+poster after it (c 400-999, texture rectangles with blending) is +5-8% in ares (v34's "blend rectangles 10-20% too dear"), +58 VI by the time the
+poster stands still at VI 10334; from there 1-VI frames run to the end and the difference stops growing (nothing visible).
+
+Parts 1 and 2 (60 fps / CPU-bound) are within 1%. The RSP is within ±2% in every part. What remains is all RDP (dp-go): part 3 (glass balls,
+mostly blending) is too dear in ares and part 4 (write-only textured triangles) too cheap — up to v11 the wrong VI factor partly hid both (next item).
+
+### v40: the VI's slowdown of the RDP by span class × VI mode × displayed buffer
+`hw/v40_*`, `rdp_timing/v40`. 8 spans per primitive × 512, ratio to the VI off (console):
+
+| span class | aa3 0x3302 | aa0 320 wide (BAR / DK64) | 640x480i aa0 (0x13052) | MGC 0x3242 (aa2, 2560 B/line) |
+|---|---|---|---|---|
+| with depth (BAR 2cyc width 13 / 32, DK64 1cyc) | **×1.006** | **×1.141 / 1.132 / 1.144** | ×1.43 / 1.36 / 1.41 | **×1.065 / 1.060 / 1.067** |
+| IMAGE_READ + blend, no depth (320 / 640 wide) | ×1.005 / 1.004 | ×1.139 / 1.089 | ×1.315 / 1.377 | ×1.060 / 1.026 |
+| write-only (320 / 640), Fill rectangles (320 / 640), Load_Block | **×1.000** (every mode, every displayed buffer) | | | |
+| ares v11's factor (applied to every span and load) | ×1.004 | ×1.117 (on the table part) | ×1.324 | ×1.03 |
+
+- ~~**The VI slows only the spans that read the colour or depth buffer back**; write-only spans, fills and TMEM loads are ×1.000~~ — **withdrawn
+  (2026-11-10)**: the VI probe in each row (last column) shows that from `wo_tex*` / `fill*` / `load` and `blend640`'s `depth_buffer` on, the probe
+  stayed at the VI-off value (≈93000): **the console's VI had stopped fetching** (a known effect of switching VI modes many times in this ROM series;
+  v29's "1.000" for MGC parts 4-6 and v37's two MGC lists are the same, probe ≈93000). Only the measurements with the VI alive (probe 94100-122000)
+  stand: depth ×1.14 (aa0) / ×1.065 (MGC), blend ×1.14 / 1.06 (320 wide), ×1.09 / 1.03 (640 wide), and **a write-only list (mgc_p4_4316, first in v42)
+  ×1.035 in the MGC mode**, v29's part 1-3 lists ×1.03. So the VI factor does not depend on the span class: whole lists ×1.03-1.035 in the MGC mode,
+  ×1.10-1.12 in the 320-wide aa0 modes.
+- The factors themselves: 1.14 for aa0 at 320 wide (ares 1.117), 1.06 in MGC's mode (ares 1.03: aa2 grows too once the line is 2560 B), 1.32-1.43 at 640x480i (ares 1.324).
+- Pointing the displayed buffer (VI_ORIGIN) at the colour buffer being drawn or at the depth buffer changes nothing for depth spans (±0.5%). Only the
+  640-wide blend case loses its slowdown entirely (×1.000) when the VI displays the depth buffer (0x6A0000, the colour buffer's megabyte); unexplained,
+  so the factor for a 4 MiB game whose displayed and drawn buffers share a megabyte cannot be settled from this alone.
+
+### The fix (patch 0016: `n64: the VI slows only read-modify-write spans; AA0 x1.14, AA2 grows with the line`) — **reverted by 0017**
+`timingScale` applies the VI factor to read-modify-write (memoryBound) spans only — not to write-only spans, fills, copies or TMEM loads.
+`viFactorAA0` 1.117 → 1.14; aa2 grows by 0.33 per 640 bytes of line above 640 (`viWidthScaleAA2`: 1.06 at 2560 B). Results-table row series v12:
+DK64 36 (24/420/56), BAR 252/328, crash +641/+667 — as v11. MGC as in the table above. Harness knobs `T_VIRMW=0` (old behaviour), `T_VIAA2` / `T_VIAA2WS`.
+
+### v41: the cost of the RDP reading the list while the RSP writes it (the fifo microcodes' path)
+The difference between a replay (the RDP fetching a list placed in RDRAM) and a real frame (the RSP's F3DEX fifo writing the list while the RDP
+follows) was measured by feeding the same lists through a small RSP microcode (`rdp_timing/v41/rsp_xbus.S`) that DMAs each chunk into an RDRAM
+output buffer and advances DP_END (`hw/v41_ntsc_003.txt`, 9 MGC + 3 BAR lists, chunks of 256 B to 2 KiB, VI off). Console `fifo / pad1k`:
+
+| list | fifo2k | fifo1k | fifo512 | fifo256 | ares v12 (fifo1k) |
+|---|---|---|---|---|---|
+| MGC part 4 (3 lists) | +7.8-10.7% | +7.8-10.7% | +8.2-11.3% | +13.2% | +7.0-9.5% |
+| MGC parts 5 / 1 / 2 / 3 / 6 | +3.2-9.7% | +2.8-9.7% | +3.3-9.9% | +4.4-12.4% | +2.7-8.2% |
+| BAR (3 lists) | +3.6-4.2% | +4.0-4.2% | +5.0-5.6% | +5.2-5.4% | +4.2-4.4% |
+
+- The RDP's loss per chunk pair (one DMA in, one out): 590-760 clk at 2 KiB on the console (ares 586-650), 330-390 at 1 KiB (ares 322-353), 190-225
+  at 512 B (ares 177-266). ares' "9 + 1.2 clk per 8 B per DMA" is within ±3% for BAR (320 wide, with depth) and, for MGC (640 wide), 15% short on
+  large DMAs and too high on small ones (the console: 1.3-1.5 clk per 8 B on the 640-wide lists, 0.9-1.0 on the 320-wide ones).
+- In the demo's part 4 frames ares charges DMA contention worth 2.1% of the frame (870 DMAs per frame), so ×1.2 would add +0.4%: **part 4's −3.3%
+  is not the cost of following the RSP's output** (the CPU's bus traffic remains the candidate: part 4 is the only part where the CPU runs the whole frame).
+- The XBUS path (the RDP reading DMEM) could not be measured: the console's RDP stalled in the first chunk (DP_STATUS 0x760, CURRENT 0x7C0, the
+  next DP_START/DP_END left pending) — not the handshake the .xbus microcodes use. A by-product: ares (upstream a774671d too) reads XBUS commands
+  from DMEM **in the wrong byte order** (`render.cpp` reads through the `Memory::Writable` base class); MGC / BAR / DK64 are fifo, so unaffected;
+  fixed in the harness.
+
+### What is left (MGC)
+- With the VI factor right, part 3 is +3.5% (640-wide 1CYC16_BLEND: in v33 too ares was 6-8 clk/span too dear from 8 spans up) and part 4 −3.3%
+  (write-only textured triangles: 3% short in the demo's frames even after v32/0013, while the list replay (VI off) gives 1.005 — the difference between
+  replay and demo, the RDP waiting on commands arriving from the RSP through the XBUS FIFO, is the candidate). Both are table-side fixes for MGC's two
+  modes and do not touch DK64 / BAR.
+- The "@" lands on its sound within ±5 VI (0.1 s) in both v11 and v12.
+
+## v42 (replays under CPU / SP DMA loads), 0016 reverted (0017, series v13) (added 2026-11-10)
+
+### Reverting 0016
+v40's "the VI does not touch write-only spans, fills and loads" was, as the VI probe shows, **measured with the VI stopped** (note in the v40 section).
+With the VI alive a write-only list is slowed ×1.035 in the MGC mode too (first list of v42, probe 94070), about the same ×1.03 as the depth lists.
+0017 reverts 0016; the VI factors are series v11's again (every span and load: aa0 1.117 / aa2 1.03 / aa3 1.004, 640x480i 1.324).
+MGC's six parts are as in v11 (+0.2 / +0.9 / +2.4 / −1.7 / −2.0 / +1.9%, +0.2% in total, the "@" +5 VI), DK64 36 (24/421/55), BAR 252/328.
+The harness keeps the 0016 behaviour behind `T_VIRMW=1 T_VIAA0=1.14 T_VIAA2WS=0.33`. The VI stopping is a test-ROM problem (`set_vi` rewrites only
+VI_CTRL / V_SYNC), so the VI-class measurement will be redone with a `set_vi` that rewrites every register and checks the probe (v43).
+
+### v42: replays with CPU / SP DMA loads running beside the RDP (`hw/v42_*`, `rdp_timing/v42`)
+The loads of v10-v12 (dependent CPU cache misses / instruction fetches / random writes / mixed / uncached writes, 64 B / 512 B RSP DMAs) beside 6 MGC
++ 2 BAR + 2 DK64 lists, `full` (RDRAM) and `fifo1k` (RSP feeding). RDP clocks lost per load operation (VI off, `full`, console | ares v12):
+
+| load | console (depth lists: BAR / DK64 / MGC p2 p3 p5) | console (write-only: MGC p4 ×3) | ares |
+|---|---|---|---|
+| SP DMA 64 B (read) | 8.1-10.4 | 10.0-10.4 | 18.1 |
+| SP DMA 512 B (read) | 69-73 | 72-74 | 85.6 |
+| CPU dependent miss (16 B fill) | 8.5-10.6 | **11.4-11.8** | 10.1 |
+| CPU instruction fetch (32 B) | 5.1-8.0 | 6.5-6.8 | 9.3 |
+| CPU random write (fill + write-back) | 12.1-15.0 | 14.1-14.6 | 9.8 |
+| CPU mixed (load/store/ALU/FPU) | 20.9-25.4 | 24.5-25.3 | 19.7 |
+| CPU uncached write | 2.0-3.6 | 2.5-2.7 | 3.6 |
+
+- The SP DMA numbers reproduce v19b's synthetic ones (64 B 10 / 512 B 76). ares' "9" in 9 + 1.2 clk per 8 B came from DK64 in-game (1164 DMAs per
+  frame at 51 clk each, task_timing v20b) and stays: in-game DMAs cost more than the synthetic ones.
+- CPU: dependent misses agree (+15% on the write-only lists only), instruction fetches are 40% too dear in ares, random writes (write-backs) 30% too
+  cheap, mixed 15-20% too cheap, uncached writes match v17's VI-off value (2.7).
+- Running the demo with coefficients set to v42 (`T_CPUXI=5.5 T_CPUXW=6 T_CPUXU=2.8 T_DMAXB=0.5 T_DMAX=1.12`) improves parts 1-3 to −0.3 / −0.3 /
+  +1.3%, the logo to 0.0% and the start of part 4 to +1 VI, but leaves parts 4 and 5 at −2.6 / −2.7% (the "@" −85 VI), BAR seg1 328 → 332, DK64 27 → 30.
+  Since it contradicts the in-game DMA calibration it is **not adopted**; kept as calibration data.
+- `fifo1k` and the CPU loads are additive (±1%). The "game" VI mode in this ROM is alive only for the first list (mgc_p4_4316: ×1.035, ×1.064-1.081
+  under the CPU loads); from the second list on the probe is at the VI-off value (the basis for reverting 0016).
+
+### Blend table correction (tried, not adopted)
+Applying v33 / v34 / v40's "blend-only (IMAGE_READ, no depth) spans: 12 (320 wide) / 7 (640 wide) of the +15 too much, and +27 fixed per triangle
+missing" in the harness (`T_BLSP=12 T_BLSPW=7 T_BLTRI=27`) lines up the synthetic frames (blend640 8 spans 0.87-0.96 → 0.94-0.99, one span
+1.17-1.48 → 0.96-1.06, 320-wide blend rectangles 0.80-0.97 → 0.98-1.04), but in the demo part 3 +3.5 → +1.7% and the poster +58 → +26 VI are paid
+for with part 2 +0.8 → −1.5%, part 5 −1.5 → −3.4% and the "@" −1 → −122 VI. The games' blend spans are also 10-15% dearer than synthetic ones (the
+same content dependence as the depth spans), so it is left out.
+
+### What is left for MGC (as of 2026-11-10)
+Part 4 −1.7%, part 5 −2.0% (write-only / blend at 640 wide: right in the replays, short in the demo's frames), part 3 +2.4%, logo +1.9%.
+v41 (RSP feeding: +9.5% console, 8.8% ares) and v42 (CPU contention) account for under 1% of the replay-vs-demo difference; the rest is unexplained.
+The "@" is at +5 VI (0.08 s).
+
+## Changes (patches 0001 to 0017, harness 9999)
 
 (`0001` is an independent bug fix: in `ares/n64/rdp/io.cpp` `RDP::readWord`, the DPC_TMEM_BUSY check was written as `if(data == 7)`, a typo that made the
 TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
@@ -969,9 +1164,9 @@ TMEM busy counter unreadable; it is corrected to `if(address == 7)`.)
 Files changed by `0002` (the RDP model): `ares/n64/rdp/timing.cpp` (new), `ares/n64/rdp/timing-model.hpp` (new, the console-measured table),
 `rdp.hpp`, `rdp.cpp`, `render.cpp`, `io.cpp`, `serialization.cpp`, `vulkan/vulkan.cpp`, `system/serialization.cpp` (state version v154),
 `n64/CMakeLists.txt`. Files changed by `0003` (CPU stalls): `ares/n64/cpu/cpu.hpp`, `cpu.cpp`, `dcache.cpp`, `recompiler.cpp`.
-All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0014 with `git am`, 9999 with `git apply --check`).
+All of them have been confirmed to apply as-is to upstream master (a774671d, as of 2026-10-26) (0001 to 0017 with `git am`, 9999 with `git apply --check`).
 `0012` is the model from the v24/v25/v28 sections (Z makes the whole span fail only for spans of 16 px or less, ATOMIC_PRIM at 20 clk/primitive, 1-cycle AA at 3.5 clk/span,
-and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), `0013` is the model of the MGC 2011 section (write-only span / triangle costs), `0014` the model of the v33-v35 section (colour/depth in the same megabyte, Load_Tile source stride), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
+and `zFailWidth` / `atomicCost` / `aaSpanCost` in `rdp.hpp`), `0013` is the model of the MGC 2011 section (write-only span / triangle costs), `0014` the model of the v33-v35 section (colour/depth in the same megabyte, Load_Tile source stride), `0015` the model of the v36 / MGC-end sections (span width = union of the four sub-scanlines), `0016` the model of the v40 section (the VI slows read-modify-write spans only), `0017` its revert (v40 had been measured with the VI stopped; 0016 and 0017 applied together give series v13), and `9999` is the verification harness (a fixed number, so it does not change from series to series).
 `0007` is the PI timing fix that gets past the MGC 2011 demo's emulator detection (`n64: make cartridge ROM ignore PI accesses faster than a mask ROM can serve`, in `cartridge.hpp` and `pi/device.hpp`), `0008`/`0009` are the models from the v17 to v19 sections above, `0010` is the v20 section's, and `0011` is the v20b section's.
 
 1. **RDP execution time model** (`timing.cpp` + `timing-model.hpp`)
@@ -1020,10 +1215,13 @@ git am 0011-n64-SP-DMA-and-CPU-bus-contention-against-the-RDP-re.patch   # v20b:
 git am 0012-n64-depth-test-savings-only-for-short-spans-ATOMIC_P.patch   # v24/v25/v28: depth-test savings only for spans up to 16 px, ATOMIC_PRIM, 1-cycle AA
 git am 0013-n64-write-only-spans-and-triangles-cost-more-on-the-.patch   # v29-v32: write-only span / triangle costs (MGC 2011)
 git am 0014-n64-depth-buffer-in-the-colour-buffer-s-megabyte-Loa.patch   # v34/v35: colour/depth in the same megabyte, Load_Tile source stride
+git am 0015-n64-triangle-spans-cover-the-union-of-the-four-sub-s.patch   # v36: span width = union of the four sub-scanlines (MGC parts 4 and 5)
+git am 0016-n64-the-VI-slows-only-read-modify-write-spans-AA0-x1.patch   # v40: the VI slows read-modify-write spans only, AA0 x1.14, AA2 grows with the line
+git am 0017-Revert-n64-the-VI-slows-only-read-modify-write-spans.patch   # 0016 reverted (the VI had stopped during v40)
 # Build as usual (cmake -B build && cmake --build build)
 ```
 
-`9999` is the headless verification harness (`headless/`, plus counting, dumping and environment-variable knobs on the core side), and is not meant for upstream (apply it on top of 0014 with `git apply`).
+`9999` is the headless verification harness (`headless/`, plus counting, dumping and environment-variable knobs on the core side), and is not meant for upstream (apply it on top of 0017 with `git apply`).
 It removes the GUI (hiro/desktop-ui) from the top-level CMake and links only the N64 core, and
 `headless <rom> <number of VI frames> --watch ADDR[:fmt] --save/--load/--poke ...` lets you observe RAM
 (it is for analysis in a Linux environment without a GUI).
@@ -1032,9 +1230,9 @@ It removes the GUI (hiro/desktop-ui) from the top-level CMake and links only the
 
 - (added 2026-11-09) The **games' triangles costing 5-12% more than synthetic ones**: v36-v38 rule out placement, texture orientation, rows
   outside the scissor, zero-width rows, edge slope, snapping, size class, drawing order and adjacency (the excess is a constant over each list).
-  The remaining candidate is how the depth test fails partially (the cost of a span of which only some pixels fail; ares blends its pass/fail
-  tables linearly), measured by v39 (`rdp_timing/v39`). The re-split of fixed cost / span cost (the 0015 candidate) is on hold because the
-  synthetic frames and the games still disagree.
+  v39 also measured partial depth failure (pixels failing individually save the console nothing; only runs of 16 or more pixels or whole spans
+  save, linearly), worth 0-3% in the replays, so not the main cause. The re-split of fixed cost / span cost is on hold because the synthetic
+  frames and the games still disagree; 0015 is the sub-scanline union (v36).
 - (added 2026-11-01, overall status) **The DK64 demo is within 1 to 2% of the console with series v7/v8** (dk64_tasklog: RDP-bound frames −1%, CPU-bound frames +2%,
   total +0.8%, and the PI DMA speed is the same). **The BAR intro is still at seg0 249 vs 230 frames (ares is 8% faster)**, and the remainder is
   (1) the part that only appears in-game (RSP DMA contention, FIFO coupling, CPU contention, together +2 to +4%), and (2) **the ±10 to 15% "scene content" dependence of the triangle cost**

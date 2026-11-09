@@ -1,0 +1,71 @@
+From 677b810625c697f9817517b9cb5ba8404bde158e Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Mon, 9 Nov 2026 20:03:09 +0900
+Subject: [PATCH] n64: the VI slows only read-modify-write spans; AA0 x1.14,
+ AA2 grows with the line (rdp_timing v40)
+
+Measured per span class, VI mode and displayed buffer on the console
+(rdp_timing v40): write-only spans, fill rectangles and TMEM loads take
+exactly the same time with the VI off and in every VI mode, while spans
+that read the colour or depth buffer back are slowed by x1.14 in the
+320-wide divot/dedither modes (AA 0/1), x1.006 with AA 3, x1.06 in the
+MGC 2011 demo's 640x480 resample-only mode (AA 2, 2560 bytes per line)
+and x1.32-1.43 in 640x480 AA 0. The model applied one factor per mode to
+everything, including the write-only spans and the loads, and x1.03 to
+the demo's mode. Now the factor is applied to memory-bound spans only,
+AA 0 is 1.14 and AA 2 grows by 0.33 per 640 bytes of line above 640.
+Donkey Kong 64 and Beetle Adventure Racing are unchanged to the frame;
+in the MGC 2011 demo the logo part comes within 1% of the console's task
+log and the "@" of the ending lands on its sound.
+---
+ ares/n64/rdp/rdp.hpp    | 3 ++-
+ ares/n64/rdp/timing.cpp | 6 +++++-
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 465dec4a..cf8044b1 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -101,7 +101,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //every VI mode on an NTSC console (rdp_timing v12/v15): AA mode 3 (replicate, one line fetched per
+     //output line) +0.4%, mode 2 (resample) +3%, modes 0/1 (anti-aliased with divot: three lines per output
+     //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
+-    f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
++    f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.14;  //read-modify-write spans only (rdp_timing v40: write-only spans, fills and TMEM loads are unaffected by the VI in every mode)
++    f64    viWidthScaleAA2 = 0.33; //AA 2 (resample only) grows more slowly with the line: x1.06 at 2560 bytes (the MGC 2011 demo's 640x480 VI_WIDTH 1280), v40
+     f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+     f64    viContendScale = 2.4;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*2.4 at 320x16 AA0 (task_timing v20b: a
+                                    //CPU line fill costs the RDP 10.4 clocks with the VI off and 13.3 in the game's VI mode; v12 x1.25, v17 x1.42)
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 227fc6b1..bb091664 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -56,7 +56,7 @@ auto RDP::timingReset() -> void {
+   timing.spanPenalty = t.spanPenalty;
+   timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+-  timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
++  timing.viWidthScale = t.viWidthScale; timing.viWidthScaleAA2 = t.viWidthScaleAA2; timing.viContendScale = t.viContendScale;
+   timing.contendDma = t.contendDma; timing.contendDmaBase = t.contendDmaBase;
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
+@@ -141,12 +141,16 @@ auto RDP::viModeFactor() -> f64 {
+   f64 f = vi.io.antialias == 3 ? timing.viFactorAA3 : vi.io.antialias == 2 ? timing.viFactorAA2 : timing.viFactorAA0;
+   u32 bytes = ((u32)vi.io.width ? (u32)vi.io.width : 320u) * (vi.io.colorDepth == 3 ? 4u : 2u);
+   if(bytes > 640 && vi.io.antialias < 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScale * ((f64)bytes / 640.0 - 1.0));
++  else if(bytes > 640 && vi.io.antialias == 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScaleAA2 * ((f64)bytes / 640.0 - 1.0));
+   return f;
+ }
+ 
+ //what a span or load costs in a running game relative to the idle-console tables
+ auto RDP::timingScale(bool memoryBound) -> f64 {
+   f64 f = memoryBound ? timing.contentionZ : timing.contentionPlain;
++  //the VI's framebuffer fetch slows only the spans that read the colour or depth buffer back: write-only spans,
++  //fills and TMEM loads take the same time in every VI mode on the console (rdp_timing v40)
++  if(!memoryBound) return f;
+   return f * viModeFactor();
+ }
+ 
+-- 
+2.43.0
+

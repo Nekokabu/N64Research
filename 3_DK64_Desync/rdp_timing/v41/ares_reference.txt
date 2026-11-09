@@ -1,0 +1,157 @@
+---- RESULTS ----
+# rdp_timing v41 - replay of Donkey Kong 64 attract-demo frames (X)
+# mi_version	0x02020102
+# tv_type	NTSC
+# memory_size	8388608
+# runs_per_case	3
+# texture at 0x0E3C80; dma buffer at 0x7D0000; heap top 0x0E6000; display buffer at 0x04D500; replayed lists at 0x700000, their data moved up to at least 0x100000
+# values: smallest DPC_CLOCK of 3 runs, including the list start and Sync_Full; ticks are COP0 count (46.875 MHz, x2 = CPU cycles, x4/3 = RDP clocks)
+# console VI: ctrl 0x3302 width 640 v_sync 0x20D x_scale 0x400
+B0	167
+# X lines: list, variant, vi mode (vi_off), clock (smallest of 3), ticks, model (ares tables of the unpatched full list), VI_CTRL read back, VI_WIDTH, VI probe
+# v24 variants: z_far / z_near = the depth-clearing fill removed and the depth buffer preset farthest / nearest (every first draw passes / every test fails); om_no_atomic = ATOMIC_PRIM off; color_low = the drawn colour buffer moved to 0x0F5000; z_up1m = the depth buffer 1 MiB higher (BAR only); tri_only_zfar / znear = the same on tri_only
+# XI lines: list, info (placement in RDRAM)
+# variants: no_tri / tri_only as v22 (NOPs replace the class); om_* patch every Set_Other_Modes (no_zcmp: Z_COMPARE off = all pass; no_zupd: Z_UPDATE off; no_aa: AA_EN off; no_persp: TEX_PERSP off; no_lod: TEX_LOD/SHARPEN/DETAIL off; 1cyc: 2-cycle lists as 1-cycle; no_dither: dither off; point: point sampling; no_tlut: EN_TLUT off; no_cvg: ALPHA_CVG_SEL/CVG_X_ALPHA/CVG_DST/COLOR_ON_CVG/ALPHA_COMPARE off; no_imrd: IMAGE_READ off; wlike: v22 W's mode bits with the list's cycle type, blender mux, Z and IMAGE_READ)
+# z_near: the depth-clearing fill removed and the depth buffer preset to 0 (every depth test fails); tri_flat: all shade/texture/depth slopes of the 0F triangles zeroed; tri_noshade/notex/edgez: 0F -> 0B / 0D / 09 (dropped words become NOPs)
+XI	mgc_p4_4316.bin	list 358912 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4316.bin	full	vi_off	1348756	1029290	1181238	0	640	92315
+X	mgc_p4_4316.bin	pad1k	vi_off	1355961	1034788	1181238	0	640	92266
+# XD	mgc_p4_4316.bin	fifo1k	output buffer at 0x680400: 0 of 47744 words differ
+X	mgc_p4_4316.bin	fifo1k	vi_off	1475352	1125875	1181238	0	640	92266
+# XD	mgc_p4_4316.bin	fifo512	output buffer at 0x680400: 0 of 48256 words differ
+X	mgc_p4_4316.bin	fifo512	vi_off	1484681	1132994	1181238	0	640	92267
+# XD	mgc_p4_4316.bin	fifo2k	output buffer at 0x680400: 0 of 47872 words differ
+X	mgc_p4_4316.bin	fifo2k	vi_off	1472331	1123569	1181238	0	640	92267
+XI	mgc_p4_3794.bin	list 299872 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_3794.bin	full	vi_off	1416928	1081316	1256973	0	640	92267
+X	mgc_p4_3794.bin	pad1k	vi_off	1423031	1085973	1256973	0	640	92267
+# XD	mgc_p4_3794.bin	fifo1k	output buffer at 0x680400: 0 of 39936 words differ
+X	mgc_p4_3794.bin	fifo1k	vi_off	1522947	1162197	1256973	0	640	92266
+# XD	mgc_p4_3794.bin	fifo512	output buffer at 0x680400: 0 of 40384 words differ
+X	mgc_p4_3794.bin	fifo512	vi_off	1530942	1168301	1256973	0	640	92267
+# XD	mgc_p4_3794.bin	fifo256	output buffer at 0x680400: 0 of 58944 words differ
+X	mgc_p4_3794.bin	fifo256	vi_off	1643901	1254504	1256973	0	640	92267
+# XD	mgc_p4_3794.bin	fifo2k	output buffer at 0x680400: 0 of 39936 words differ
+X	mgc_p4_3794.bin	fifo2k	vi_off	1519888	1159863	1256973	0	640	92267
+XI	mgc_p4_4772.bin	list 339872 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p4_4772.bin	full	vi_off	1188833	907243	1036610	0	640	92266
+X	mgc_p4_4772.bin	pad1k	vi_off	1195715	912495	1036610	0	640	92267
+# XD	mgc_p4_4772.bin	fifo1k	output buffer at 0x680400: 0 of 45184 words differ
+X	mgc_p4_4772.bin	fifo1k	vi_off	1308737	998724	1036610	0	640	92267
+# XD	mgc_p4_4772.bin	fifo512	output buffer at 0x680400: 0 of 45760 words differ
+X	mgc_p4_4772.bin	fifo512	vi_off	1317861	1005684	1036610	0	640	92267
+# XD	mgc_p4_4772.bin	fifo2k	output buffer at 0x680400: 0 of 45312 words differ
+X	mgc_p4_4772.bin	fifo2k	vi_off	1305815	996491	1036610	0	640	92266
+XI	mgc_p5_5075.bin	list 160152 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p5_5075.bin	full	vi_off	1682843	1284202	1669759	0	640	92266
+X	mgc_p5_5075.bin	pad1k	vi_off	1704307	1300631	1669759	0	640	92267
+# XD	mgc_p5_5075.bin	fifo1k	output buffer at 0x680400: 0 of 22016 words differ
+X	mgc_p5_5075.bin	fifo1k	vi_off	1759478	1342708	1669759	0	640	92266
+# XD	mgc_p5_5075.bin	fifo512	output buffer at 0x680400: 0 of 24448 words differ
+X	mgc_p5_5075.bin	fifo512	vi_off	1775191	1354699	1669759	0	640	92267
+# XD	mgc_p5_5075.bin	fifo256	output buffer at 0x680400: 0 of 29984 words differ
+X	mgc_p5_5075.bin	fifo256	vi_off	1812298	1383018	1669759	0	640	92266
+# XD	mgc_p5_5075.bin	fifo2k	output buffer at 0x680400: 0 of 21248 words differ
+X	mgc_p5_5075.bin	fifo2k	vi_off	1753778	1338358	1669759	0	640	92267
+XI	mgc_p5_5549.bin	list 133960 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p5_5549.bin	full	vi_off	1705729	1301716	1682750	0	640	92267
+X	mgc_p5_5549.bin	pad1k	vi_off	1709741	1304778	1682750	0	640	92267
+# XD	mgc_p5_5549.bin	fifo1k	output buffer at 0x680400: 0 of 18432 words differ
+X	mgc_p5_5549.bin	fifo1k	vi_off	1755963	1340025	1682750	0	640	92267
+# XD	mgc_p5_5549.bin	fifo512	output buffer at 0x680400: 0 of 20352 words differ
+X	mgc_p5_5549.bin	fifo512	vi_off	1768784	1349812	1682750	0	640	92267
+# XD	mgc_p5_5549.bin	fifo256	output buffer at 0x680400: 0 of 25024 words differ
+X	mgc_p5_5549.bin	fifo256	vi_off	1800033	1373660	1682750	0	640	92266
+# XD	mgc_p5_5549.bin	fifo2k	output buffer at 0x680400: 0 of 17664 words differ
+X	mgc_p5_5549.bin	fifo2k	vi_off	1750928	1336182	1682750	0	640	92267
+XI	mgc_p3_2555.bin	list 470688 B, prefix 10, z 46A000+524800, regions 1891D0-680200, offset +000000
+X	mgc_p3_2555.bin	full	vi_off	1904867	1453690	1908320	0	640	92266
+X	mgc_p3_2555.bin	pad1k	vi_off	1914770	1461247	1908320	0	640	92266
+# XD	mgc_p3_2555.bin	fifo1k	output buffer at 0x680400: 0 of 62720 words differ
+X	mgc_p3_2555.bin	fifo1k	vi_off	2071553	1580870	1908320	0	640	92267
+# XD	mgc_p3_2555.bin	fifo512	output buffer at 0x680400: 0 of 63104 words differ
+X	mgc_p3_2555.bin	fifo512	vi_off	2082155	1588961	1908320	0	640	92266
+# XD	mgc_p3_2555.bin	fifo2k	output buffer at 0x680400: 0 of 59904 words differ
+X	mgc_p3_2555.bin	fifo2k	vi_off	2052819	1566573	1908320	0	640	92267
+XI	mgc_p2_1802.bin	list 239152 B, prefix 10, z 46A000+524800, regions 188510-680200, offset +000000
+X	mgc_p2_1802.bin	full	vi_off	2106344	1607448	2144538	0	640	92266
+X	mgc_p2_1802.bin	pad1k	vi_off	2109064	1609525	2144538	0	640	92267
+# XD	mgc_p2_1802.bin	fifo1k	output buffer at 0x680400: 0 of 30976 words differ
+X	mgc_p2_1802.bin	fifo1k	vi_off	2186613	1668682	2144538	0	640	92266
+# XD	mgc_p2_1802.bin	fifo512	output buffer at 0x680400: 0 of 33472 words differ
+X	mgc_p2_1802.bin	fifo512	vi_off	2203831	1681819	2144538	0	640	92267
+# XD	mgc_p2_1802.bin	fifo256	output buffer at 0x680400: 0 of 43616 words differ
+X	mgc_p2_1802.bin	fifo256	vi_off	2268823	1731421	2144538	0	640	92266
+# XD	mgc_p2_1802.bin	fifo2k	output buffer at 0x680400: 0 of 30720 words differ
+X	mgc_p2_1802.bin	fifo2k	vi_off	2183193	1666072	2144538	0	640	92266
+XI	mgc_p1_0152.bin	list 93568 B, prefix 10, z 46A000+524800, regions 1D3B70-680200, offset +000000
+X	mgc_p1_0152.bin	full	vi_off	824984	629569	778475	0	640	92267
+X	mgc_p1_0152.bin	pad1k	vi_off	826906	631036	778475	0	640	92267
+# XD	mgc_p1_0152.bin	fifo1k	output buffer at 0x680400: 0 of 12544 words differ
+X	mgc_p1_0152.bin	fifo1k	vi_off	858422	655060	778475	0	640	92266
+# XD	mgc_p1_0152.bin	fifo512	output buffer at 0x680400: 0 of 12736 words differ
+X	mgc_p1_0152.bin	fifo512	vi_off	861253	657220	778475	0	640	92267
+# XD	mgc_p1_0152.bin	fifo256	output buffer at 0x680400: 0 of 18176 words differ
+X	mgc_p1_0152.bin	fifo256	vi_off	894693	682740	778475	0	640	92266
+# XD	mgc_p1_0152.bin	fifo2k	output buffer at 0x680400: 0 of 12544 words differ
+X	mgc_p1_0152.bin	fifo2k	vi_off	857529	654378	778475	0	640	92267
+XI	mgc_p6_5810.bin	list 211152 B, prefix 10, z 46A000+524800, regions 213D20-680200, offset +000000
+X	mgc_p6_5810.bin	full	vi_off	1040462	794013	961353	0	640	92267
+X	mgc_p6_5810.bin	pad1k	vi_off	1045653	797974	961353	0	640	92266
+# XD	mgc_p6_5810.bin	fifo1k	output buffer at 0x680400: 0 of 28544 words differ
+X	mgc_p6_5810.bin	fifo1k	vi_off	1117126	852491	961353	0	640	92266
+# XD	mgc_p6_5810.bin	fifo512	output buffer at 0x680400: 0 of 31808 words differ
+X	mgc_p6_5810.bin	fifo512	vi_off	1138235	868601	961353	0	640	92267
+# XD	mgc_p6_5810.bin	fifo256	output buffer at 0x680400: 0 of 39360 words differ
+X	mgc_p6_5810.bin	fifo256	vi_off	1188547	906997	961353	0	640	92266
+# XD	mgc_p6_5810.bin	fifo2k	output buffer at 0x680400: 0 of 27648 words differ
+X	mgc_p6_5810.bin	fifo2k	vi_off	1110780	847648	961353	0	640	92267
+XI	bar_2316.bin	list 174952 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_2316.bin	full	vi_off	1413261	1078517	1237577	0	640	92266
+X	bar_2316.bin	pad1k	vi_off	1420352	1083929	1237577	0	640	92267
+# XD	bar_2316.bin	fifo1k	output buffer at 0x500000: 0 of 24704 words differ
+X	bar_2316.bin	fifo1k	vi_off	1482230	1131123	1237577	0	640	92267
+# XD	bar_2316.bin	fifo512	output buffer at 0x500000: 0 of 30144 words differ
+X	bar_2316.bin	fifo512	vi_off	1514036	1155396	1237577	0	640	92267
+# XD	bar_2316.bin	fifo256	output buffer at 0x500000: 0 of 30656 words differ
+X	bar_2316.bin	fifo256	vi_off	1525261	1163966	1237577	0	640	92267
+# XD	bar_2316.bin	fifo2k	output buffer at 0x500000: 0 of 23040 words differ
+X	bar_2316.bin	fifo2k	vi_off	1471913	1123250	1237577	0	640	92266
+XI	bar_i2274.bin	list 64512 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_i2274.bin	full	vi_off	516680	394235	571596	0	640	92267
+X	bar_i2274.bin	pad1k	vi_off	521443	397919	571596	0	640	92266
+# XD	bar_i2274.bin	fifo1k	output buffer at 0x500000: 0 of 9088 words differ
+X	bar_i2274.bin	fifo1k	vi_off	544333	415360	571596	0	640	92266
+# XD	bar_i2274.bin	fifo512	output buffer at 0x500000: 0 of 10624 words differ
+X	bar_i2274.bin	fifo512	vi_off	553637	422460	571596	0	640	92267
+# XD	bar_i2274.bin	fifo256	output buffer at 0x500000: 0 of 10912 words differ
+X	bar_i2274.bin	fifo256	vi_off	558237	425974	571596	0	640	92266
+# XD	bar_i2274.bin	fifo2k	output buffer at 0x500000: 0 of 8448 words differ
+X	bar_i2274.bin	fifo2k	vi_off	540590	412504	571596	0	640	92266
+XI	bar_i2314.bin	list 170608 B, prefix 22, z 3DA800+153600, regions 0E4498-400000, offset +100000
+X	bar_i2314.bin	full	vi_off	1427967	1089741	1564545	0	640	92267
+X	bar_i2314.bin	pad1k	vi_off	1435172	1095239	1564545	0	640	92267
+# XD	bar_i2314.bin	fifo1k	output buffer at 0x500000: 0 of 24192 words differ
+X	bar_i2314.bin	fifo1k	vi_off	1495771	1141457	1564545	0	640	92267
+# XD	bar_i2314.bin	fifo512	output buffer at 0x500000: 0 of 29248 words differ
+X	bar_i2314.bin	fifo512	vi_off	1525436	1164096	1564545	0	640	92267
+# XD	bar_i2314.bin	fifo256	output buffer at 0x500000: 0 of 29952 words differ
+X	bar_i2314.bin	fifo256	vi_off	1537459	1173275	1564545	0	640	92267
+# XD	bar_i2314.bin	fifo2k	output buffer at 0x500000: 0 of 22528 words differ
+X	bar_i2314.bin	fifo2k	vi_off	1485593	1133690	1564545	0	640	92267
+XI	dk64_797.bin	list 350424 B, prefix 20, z 5D2E00+153600, regions 01D240-5F8600, offset +100000
+X	dk64_797.bin	full	vi_off	1214645	926893	1012163	0	640	92266
+X	dk64_797.bin	pad1k	vi_off	1244488	949717	1012163	0	640	92267
+X	dk64_797.bin	fifo1k	skipped: no RDRAM hole for the output buffer
+X	dk64_797.bin	fifo512	skipped: no RDRAM hole for the output buffer
+X	dk64_797.bin	fifo256	skipped: no RDRAM hole for the output buffer
+X	dk64_797.bin	fifo2k	skipped: no RDRAM hole for the output buffer
+XI	dk64_d6373.bin	list 246984 B, prefix 22, z 5D2E00+153600, regions 01D240-5F8600, offset +100000
+X	dk64_d6373.bin	full	vi_off	2184813	1667334	2362529	0	640	92267
+X	dk64_d6373.bin	pad1k	vi_off	2192512	1673208	2362529	0	640	92266
+X	dk64_d6373.bin	fifo1k	skipped: no RDRAM hole for the output buffer
+X	dk64_d6373.bin	fifo512	skipped: no RDRAM hole for the output buffer
+X	dk64_d6373.bin	fifo256	skipped: no RDRAM hole for the output buffer
+X	dk64_d6373.bin	fifo2k	skipped: no RDRAM hole for the output buffer
+---- END ----
+DONE
