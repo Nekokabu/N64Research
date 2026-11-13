@@ -1,0 +1,46 @@
+N64 RDRAM speed test v1.2 (libdragon)
+TV:NTSC  RAM:8 MiB  ExpPak:yes  CPU:93.75 MHz  Timer:46.875 MHz
+Cart: unknown/none
+best of 3 runs, IRQ off, MB=10^6 B, op=ld/sd 8B lw/sw 4B DMA 4KiB
+
+[Region A: base RDRAM (0-4 MiB)] 0x80200000-0x802FFFFF (1024 KiB window)
+pattern check          OK (0 errors)
+cached   read  ld seq    35.70 MB/s   224.07 ns/op   21.0 cyc/op
+cached   read  lw seq    32.33 MB/s   123.69 ns/op   11.5 cyc/op
+cached   write sd seq    20.58 MB/s   388.67 ns/op   36.4 cyc/op
+cached   write sw seq    20.56 MB/s   194.48 ns/op   18.2 cyc/op
+cached   memcpy 512K     12.15 MB/s   658.31 ns/op   61.7 cyc/op
+uncached read  ld seq    20.56 MB/s   389.07 ns/op   36.4 cyc/op
+uncached read  lw seq    10.59 MB/s   377.41 ns/op   35.3 cyc/op
+uncached write sd seq    38.90 MB/s   205.62 ns/op   19.2 cyc/op
+uncached write sw seq    21.16 MB/s   189.03 ns/op   17.7 cyc/op
+random cached  (miss)    490.01 ns/hop    45.9 cyc/hop
+random uncached lw       479.97 ns/hop    44.9 cyc/hop
+RSP DMA RDRAM->DMEM     353.95 MB/s 11572.16 ns/op 1084.8 cyc/op
+RSP DMA DMEM->RDRAM     388.81 MB/s 10534.50 ns/op  987.6 cyc/op
+
+[Region B: Expansion Pak (4-8 MiB)] 0x80600000-0x806FFFFF (1024 KiB window)
+pattern check          OK (0 errors)
+cached   read  ld seq    35.69 MB/s   224.09 ns/op   21.0 cyc/op
+cached   read  lw seq    32.30 MB/s   123.83 ns/op   11.6 cyc/op
+cached   write sd seq    20.57 MB/s   388.77 ns/op   36.4 cyc/op
+cached   write sw seq    20.56 MB/s   194.52 ns/op   18.2 cyc/op
+cached   memcpy 512K     12.14 MB/s   658.52 ns/op   61.7 cyc/op
+uncached read  ld seq    20.56 MB/s   389.09 ns/op   36.4 cyc/op
+uncached read  lw seq    10.59 MB/s   377.36 ns/op   35.3 cyc/op
+uncached write sd seq    38.91 MB/s   205.59 ns/op   19.2 cyc/op
+uncached write sw seq    21.16 MB/s   189.03 ns/op   17.7 cyc/op
+random cached  (miss)    490.24 ns/hop    45.9 cyc/hop
+random uncached lw       480.07 ns/hop    45.0 cyc/hop
+RSP DMA RDRAM->DMEM     367.04 MB/s 11159.33 ns/op 1046.1 cyc/op
+RSP DMA DMEM->RDRAM     385.39 MB/s 10628.16 ns/op  996.3 cyc/op
+
+[MiB sweep] read-only, ld seq, MB/s  (cached / uncached)
+MiB 0  0x80000000    34.09 /   19.40
+MiB 1  0x80100000    35.68 /   20.56
+MiB 2  0x80200000    35.70 /   20.56
+MiB 3  0x80300000    35.69 /   20.56
+MiB 4  0x80400000    35.69 /   20.56  (Expansion Pak)
+MiB 5  0x80500000    35.69 /   20.56  (Expansion Pak)
+MiB 6  0x80600000    35.69 /   20.56  (Expansion Pak)
+MiB 7  0x80700000    35.70 /   20.56  (Expansion Pak)
