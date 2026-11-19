@@ -1,7 +1,7 @@
-From b6c72090714e6eaad208147b25fb510848850a22 Mon Sep 17 00:00:00 2001
+From 0c4b7f04731ad6688b8ea52f3418080d9ed4b792 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Tue, 27 Oct 2026 20:20:28 +0900
-Subject: [PATCH 03/12] n64: stall CPU cache line transfers while the RDP is
+Subject: [PATCH 03/32] n64: stall CPU cache line transfers while the RDP is
  drawing
 
 With the RDP timing model in place, the CPU still ran at its idle speed while
@@ -23,9 +23,6 @@ Checked against 60fps captures of a console: the Beetle Adventure Racing
 intro's helicopter crash now happens within a frame of the hardware (it was
 about 20 frames early with the RDP model alone), and the Donkey Kong 64
 attract demo still plays back correctly.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/cpu/cpu.cpp        | 9 +++++++++
  ares/n64/cpu/cpu.hpp        | 9 ++++++++-
@@ -103,10 +100,10 @@ index 4de28e0a..7f8ac0e1 100644
    cpu.busWriteBurst<DCache>(tag | index, words);
  }
 diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
-index b84272aa..6e624e39 100644
+index 8158048b..c7f59f2a 100644
 --- a/ares/n64/cpu/recompiler.cpp
 +++ b/ares/n64/cpu/recompiler.cpp
-@@ -823,6 +823,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+@@ -827,6 +827,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
            if(!sdram) add64(mem0(RdramRbusIcacheReadsAddr), mem0(RdramRbusIcacheReadsAddr), imm(ICache));
          }
          emitCpuStep(96);

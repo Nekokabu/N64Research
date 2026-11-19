@@ -1,8 +1,8 @@
-From 727f441b3a9542d2ddcac1f90fd0be64ee387daf Mon Sep 17 00:00:00 2001
+From 5720b1a44ad46d3d5d983b5681693f55a44d1619 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Tue, 10 Nov 2026 01:28:13 +0900
-Subject: [PATCH] Revert "n64: the VI slows only read-modify-write spans; AA0
- x1.14, AA2 grows with the line (rdp_timing v40)"
+Subject: [PATCH 17/32] Revert "n64: the VI slows only read-modify-write spans;
+ AA0 x1.14, AA2 grows with the line (rdp_timing v40)"
 
 The v40 measurement behind 0016 was invalid for the write-only, fill and
 load cases: the VI probe recorded with every case shows the VI had stopped

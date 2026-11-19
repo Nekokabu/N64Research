@@ -1,7 +1,7 @@
-From 04ccd18d8fc2ebbc1d16cc3870b061951c19cd51 Mon Sep 17 00:00:00 2001
+From 89ddf5d0ade106387c6802ebf2cf98f318091381 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 03:44:53 +0900
-Subject: [PATCH 04/12] n64: RDP timing: VI-mode factors, per-transfer bus
+Subject: [PATCH 04/32] n64: RDP timing: VI-mode factors, per-transfer bus
  contention and span penalty from hardware
 
 The RDP model's corrections to the stacked-primitive tables were fitted to two scenes.
@@ -37,9 +37,6 @@ closest to the console so far (score 22 against 69 before). Beetle Adventure Rac
 scene matches the console (68/74/66 VI per 30 frames against 70/76/69); the intro runs
 2.0 VI per frame where the console runs 2.5: both the CPU and the RDP sit within a few
 percent of the 2-VI boundary there, on both sides of it.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/cpu/cpu.cpp    | 21 ++++++++++++++++++---
  ares/n64/cpu/cpu.hpp    | 28 ++++++++++++++++++++++------

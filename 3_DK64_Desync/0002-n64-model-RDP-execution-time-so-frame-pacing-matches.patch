@@ -1,7 +1,7 @@
-From 6a7a991a9579a6a590175f341ab9caf26f122745 Mon Sep 17 00:00:00 2001
+From 53f6c1be2ea8ebc43ea67f1e83377356baa507ab Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Mon, 12 Oct 2026 04:08:20 +0900
-Subject: [PATCH 02/12] n64: model RDP execution time so frame pacing matches
+Subject: [PATCH 02/32] n64: model RDP execution time so frame pacing matches
  hardware
 
 The RDP used to execute a whole command list instantly and raise the DP (Sync_Full)
@@ -43,9 +43,6 @@ frames per scene are within 10% in the heaviest scene (see the following commit 
 the CPU side of the same measurements).
 
 Save state format bumped (v154).
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/CMakeLists.txt           |   2 +
  ares/n64/rdp/io.cpp               |   2 +-

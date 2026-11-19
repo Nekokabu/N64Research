@@ -1,8 +1,8 @@
-From 8d8efb24b8e27e306495651afce31e1e90f3149d Mon Sep 17 00:00:00 2001
+From f3d30a0e1e822a3c397ef03eede783ffd3b13773 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sun, 8 Nov 2026 21:49:33 +0900
-Subject: [PATCH] n64: depth buffer in the colour buffer's megabyte, Load_Tile
- source stride (rdp_timing v34/v35)
+Subject: [PATCH 14/32] n64: depth buffer in the colour buffer's megabyte,
+ Load_Tile source stride (rdp_timing v34/v35)
 
 Two effects measured on the console that the tables did not carry:
 

@@ -1,0 +1,112 @@
+From 7b63caf5c9b1031fdd4fe78e05fa1a766d8d74f3 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 15 Nov 2026 21:06:04 +0900
+Subject: [PATCH 24/32] n64: DPC_START stays pending until the RDP has worked
+ through what came before (task_timing v21)
+
+task_timing v21 replays six graphics tasks of Beetle Adventure Racing's intro
+on the console and follows DPC_END (what the RSP has handed over) and
+DPC_CURRENT (what the RDP has fetched) through the wraps of F3DEX2's 8 KiB
+output buffer. On the console the RSP is never more than the buffer (8.1 to
+8.3 KiB) ahead of the RDP. Here it got up to 39 KiB ahead and finished its
+task 3 to 8% early (frame s1767: RSP done after 1.439 VI, console 1.559).
+
+F3DEX2 waits for START_VALID in DPC_STATUS to clear before it rewinds its
+buffer again. The bit was cleared by the next DPC_END write, so the microcode
+could rewind while the modelled RDP was still buffers behind. It now stays set
+for a range that began at a new DPC_START until the work queued before that
+range is done, which is when the RDP switches to the new start address.
+
+With it the RSP's lead is 8.2 to 8.3 KiB and its task ends where the
+console's does within 4% (s1767: 1.523 VI). The replayed lists and the MGC
+2011 demo read the same as before.
+---
+ ares/n64/rdp/io.cpp            | 12 +++++++++++-
+ ares/n64/rdp/rdp.cpp           |  1 +
+ ares/n64/rdp/rdp.hpp           |  3 ++-
+ ares/n64/rdp/serialization.cpp |  2 +-
+ 4 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/ares/n64/rdp/io.cpp b/ares/n64/rdp/io.cpp
+index 9f2cd4e9..3d2b3a38 100644
+--- a/ares/n64/rdp/io.cpp
++++ b/ares/n64/rdp/io.cpp
+@@ -44,7 +44,14 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
+     data.bit( 7) = command.ready;
+     data.bit( 8) = 0;  //DMA busy
+     data.bit( 9) = command.endValid;
++    //START_VALID: a DPC_START written while the RDP is busy stays pending until the RDP has worked through everything it
++    //was given before (task_timing v21: on the console F3DEX2, which waits for this bit before it rewinds its 8 KiB
++    //output buffer again, never gets more than the buffer ahead of the RDP; with the bit cleared at the next DPC_END
++    //write it got up to five buffers ahead here and finished its task 3 to 8% early)
+     data.bit(10) = command.startValid;
++    if(timing.enable && timing.pending) {
++      for(u32 n : range(timing.rangeCount)) { auto& r = timing.ranges[(timing.rangeHead + n) & 2047]; if(r.fresh && r.before > timing.completed) { data.bit(10) = 1; break; } }
++    }
+     if(&thread == &cpu) cpu.forceSynchronize();
+   }
+ 
+@@ -90,15 +97,18 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+   if(address == 1) {
+     //DPC_END
+     command.end = data.bit(0,23) & ~7;
++    if(command.startValid) timing.rangeFresh = 1;
+     if(command.startValid) {
+       command.current = command.start;
+       command.startValid = 0;
+     }
+-    Timing::Range range{command.current, command.end, timing.submitted, 0};
++    Timing::Range range{command.current, command.end, timing.submitted, 0, 0};
+     flushCommands();
+     range.after = timing.submitted;
++    range.fresh = timing.rangeFresh;
+     if(timing.enable && range.after > range.before) {
+       auto& t = timing;
++      t.rangeFresh = 0;
+       if(t.rangeCount == 2048) { t.rangeHead = (t.rangeHead + 1) & 2047; t.rangeCount--; }
+       t.ranges[(t.rangeHead + t.rangeCount) & 2047] = range; t.rangeCount++;
+     }
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 1dbff502..5ca2ee19 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -29,6 +29,7 @@ auto RDP::crash(const char *reason) -> void {
+   timing.pending = 0;
+   timing.syncQueued = 0;
+   timing.rangeCount = 0;
++  timing.rangeFresh = 0;
+ }
+ 
+ auto RDP::main() -> void {
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 3a2511b7..02777194 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -212,9 +212,10 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //the task ends 0.05-0.3 VI before the RDP does (task_timing v20). So each DPC_END write records the
+     //range and the work it queued, and DPC_CURRENT is read as the point of the oldest unfinished range
+     //that the completed work has reached.
+-    struct Range { u32 start, end; u64 before, after; };
++    struct Range { u32 start, end; u64 before, after; bool fresh; };
+     Range  ranges[2048];
+     u32    rangeHead, rangeCount;
++    bool   rangeFresh;             //the next range begins at a new DPC_START
+   } timing;
+ 
+   struct Command {
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index 5fb8cebf..c765717b 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -48,7 +48,7 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.syncTargets);
+   s(timing.framePixels);
+   s(timing.frameCycles);
+-  if(s.reading()) timing.rangeHead = timing.rangeCount = 0;  //the fetch-pointer ranges are not saved: DPC_CURRENT reads as DPC_END until the next DPC_END write
++  if(s.reading()) timing.rangeHead = timing.rangeCount = 0, timing.rangeFresh = 0;  //the fetch-pointer ranges are not saved: DPC_CURRENT reads as DPC_END until the next DPC_END write
+ 
+   s(edge.lmajor);
+   s(edge.level);
+-- 
+2.43.0
+

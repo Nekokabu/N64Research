@@ -1,7 +1,7 @@
-From e3c57e0a432bafefeee24494d5129c0547255546 Mon Sep 17 00:00:00 2001
+From bc23076ae80df251341a7b408ca80cbe7f36fc82 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sun, 1 Nov 2026 23:52:00 +0900
-Subject: [PATCH 12/12] n64: depth-test savings only for short spans,
+Subject: [PATCH 12/32] n64: depth-test savings only for short spans,
  ATOMIC_PRIM and 1-cycle anti-aliasing costs (rdp_timing v24/v25/v28)
 
 Replaying the games' frames on the console with the depth buffer preset so that

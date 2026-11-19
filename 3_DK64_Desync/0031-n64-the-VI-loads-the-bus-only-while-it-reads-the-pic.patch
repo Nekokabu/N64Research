@@ -1,0 +1,327 @@
+From e5174b480abcee605ccebf770f265e2b0181d359 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Thu, 19 Nov 2026 22:28:43 +0900
+Subject: [PATCH 31/32] n64: the VI loads the bus only while it reads the
+ picture (task_timing v26)
+
+The VI factors of the timing model (how much longer the RDP's spans and
+loads take, what a CPU or SP DMA transfer costs the RDP, how long an SP
+DMA and a CPU cache line transfer take themselves) were measured as the
+time of a whole list or task with the VI on over that with it off, and
+applied at every moment. But the VI reads RDRAM only on the lines of the
+picture (VI_V_VIDEO): for 0.097 VI of every field, the vertical
+blanking, it leaves the bus alone.
+
+Console (task_timing v26, Beetle Adventure Racing (J) intro tasks
+replayed, the RDP's progress sampled every 1/50 VI): relative to the
+same task with the VI off the RDP runs at 0.85 to 0.91 of its speed
+before and after the blanking and at 0.96 to 1.01 during it.
+
+The replays start at a known line (VI_V_CURRENT 330 of 525, 1 ms before
+the task) and spend 12 to 17% of their time in the blanking. The game
+starts its graphics task 0.08 VI after the VI interrupt, just as the
+picture begins, so a task shorter than 0.89 VI never sees a blanking.
+Frame by frame against the game's own log (bar_tasklog with the CPU
+waiting, the content of a frame is fixed by its number) the same task
+took 0.025 to 0.041 VI longer in the game than replayed; the model had
+0.003 to 0.005. This was most of what the first scene's light frames
+lacked (go to RSP done -4.8% in frames 20 to 39 with the CPU waiting;
+the CPU's part, normal minus waiting, was within 0.87 to 1.13 of the
+console's).
+
+- VI::picture(): the VI is on a line of the picture.
+- Spans and loads are priced as if the VI read the picture all the
+  time; the part the VI adds is kept apart (timing.pendingVi) and not
+  spent while the VI is outside the picture (timingStep).
+- The transfer losses (contendScale), the megabyte-of-the-VI terms of
+  CPU transfers and SP DMAs, the SP DMA's own duration and the CPU's VI
+  stall apply only inside the picture.
+- Inside the picture every VI part is 1.16 times what it was
+  (timing.viPicture): with that the six replays of task_timing v26 keep
+  their measured time (model minus console +0.10% on average, as before).
+
+Results (console): Beetle Adventure Racing intro, first scene 232
+frames (231; was 239), every block of 60 VI within one frame; second
+scene 319 (325; was 323). Donkey Kong 64 DKTV demo frame deltas 2 / 3 /
+4+ = 11 / 378 / 33 (9 / 388 / 25; was 10 / 376 / 34). MGC 2011 demo
+unchanged (parts within -0.1 to +0.2%, part 5 +1.3%, "@" +20 VI).
+---
+ ares/n64/cpu/cpu.cpp           |  7 +++-
+ ares/n64/cpu/cpu.hpp           |  1 +
+ ares/n64/rdp/rdp.cpp           |  1 +
+ ares/n64/rdp/rdp.hpp           | 13 ++++++++
+ ares/n64/rdp/serialization.cpp |  2 ++
+ ares/n64/rdp/timing.cpp        | 59 ++++++++++++++++++++++++++--------
+ ares/n64/rsp/dma.cpp           |  6 ++--
+ ares/n64/vi/vi.hpp             |  8 +++++
+ 8 files changed, 79 insertions(+), 18 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index a652a31c..e0a2ab4f 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -195,7 +195,12 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+ 
+ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind, u32 address) -> u32 {
+   u32 total = 0;
+-  if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
++  if(rdp.timing.enable && vi.picture() && vi.io.antialias < 2) {  //the VI's three-line fetch, while it reads the picture
++    viStallCarry += viStallCycles * rdp.timing.viPicture;
++    u32 stall = (u32)viStallCarry;
++    viStallCarry -= stall;
++    total += stall;
++  }
+   if(rdp.timing.enable && rsp.dma.busy.any()) {  //an SP DMA in flight: the two transfers delay each other (rsp_timing v19)
+     rsp.dma.clock -= RSP::DmaCpuPenaltyClocks;
+     total += RSP::DmaCpuStallCycles;
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index 06add39f..ffc813ff 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -66,6 +66,7 @@ struct CPU : Thread {
+   enum : u32 { ICacheFillCycles = 48, DCacheFillCycles = 40, DCacheWriteBackCycles = 25 };  //cpu_timing v14: fill 41 incl. the load, write-back 25
+   enum : u32 { ViStallFill = 6, ViStallIFill = 6, ViStallWriteBack = 2 };
+   u32 viStallCycles = ViStallFill;  //the VI part of the stall for the transfer in progress
++  f64 viStallCarry = 0.0;           //its fraction of a cycle carried to the next transfer
+   //The write buffer (cpu_timing v14/v18). Stores that leave the CPU (uncached RDRAM, RCP registers,
+   //dirty cache lines) are posted to a 4-entry buffer and drained in order: an uncached RDRAM word
+   //occupies the bus for 16 cycles (a 16-byte line 17), an SP/DP register write 10, an MI register 2.
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 9fd8dcb6..61c3b446 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -27,6 +27,7 @@ auto RDP::crash(const char *reason) -> void {
+   command.pipeBusy = 1;
+   command.bufferBusy = 1;
+   timing.pending = 0;
++  timing.pendingVi = timing.viPart = timing.viCarry = 0.0;
+   timing.syncQueued = 0;
+   timing.rangeCount = 0;
+   timing.rangeFresh = 0;
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index cda06115..778539b6 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -82,6 +82,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto viModeFactor() -> f64;
+   enum : u32 { ContendDma, ContendCpu };  //who took the bus: an SP DMA, a CPU transfer
+   auto contendScale(u32 kind) -> f64;
++  auto viPictureFactor() -> f64;
++  auto timingVi(f64 cost) -> f64;
+   enum : u32 { CpuDataFill, CpuInstructionFill, CpuWriteBack, CpuUncachedWrite };
+   auto timingCpu(u32 kind, f64 clocks, u32 address) -> f64;
+   auto timingLoss(f64 cost, f64 data, f64 instruction) -> void;
+@@ -127,6 +129,14 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //output line) +0.4%, mode 2 (resample) +3%, modes 0/1 (anti-aliased with divot: three lines per output
+     //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
+     f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
++    //The factors above (and the VI parts of the losses below) were measured as the time of a whole list or task with the VI
++    //on over that with it off. But the VI reads RDRAM only on the lines of the picture (VI::picture): a list that runs
++    //through a vertical blanking, 0.097 VI long, loses less of its time than one that runs between two of them. The
++    //replays of task_timing start at a known line (half-line 333 of 525) and spend 12 to 17% of their time in the blanking;
++    //a game starts its graphics task just after the blanking (Beetle Adventure Racing 0.08 VI after the VI interrupt), so a
++    //task shorter than 0.89 VI never sees one. Inside the picture every VI part is this much larger, outside it is gone
++    //(task_timing v26: with 1.16 the replays of six tasks keep their measured time).
++    f64    viPicture = 1.16;
+     f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+     //the per-transfer losses below grow with the VI factor, each kind of transfer by its own amount: loss x (1 + (factor - 1) x scale).
+     //rdp_timing v56 (SP DMA and CPU loads beside four game lists, VI off and in the title's mode, the VI checked to be
+@@ -243,6 +253,9 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     u64    submitted;              //total work submitted
+     u64    completed;              //total work completed
+     u64    pending;                //submitted - completed
++    f64    pendingVi = 0.0;        //the part of 'pending' the VI's traffic adds: it is not spent while the VI is outside the picture
++    f64    viPart = 0.0;           //the same for the command being priced
++    f64    viCarry = 0.0;          //fraction of a system clock of work carried over between steps outside the picture
+     u64    syncTargets[8];         //'submitted' snapshot at each pending Sync_Full
+     u32    syncQueued;             //number of Sync_Full commands whose interrupt is still pending
+ 
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index fc2ce98c..9337428b 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -53,6 +53,8 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.submitted);
+   s(timing.completed);
+   s(timing.pending);
++  s(timing.pendingVi);
++  s(timing.viCarry);
+   s(timing.syncQueued);
+   s(timing.syncTargets);
+   s(timing.framePixels);
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 9754ff5f..567a9791 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -103,7 +103,10 @@ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+   //in AA mode 2 (resample only, the MGC demo's) the VI slows the whole list, not only its spans and loads: the console's
+   //lists take 1.026 to 1.035 times as long with the VI on whatever they consist of (rdp_timing v29 / v42 / v53; the
+   //factor on spans and loads alone gave 1.023 to 1.026, least for the lists of small triangles)
+-  if(vi.io.antialias == 2) cycles *= viModeFactor();
++  if(vi.io.antialias == 2) { f64 part = cycles * (viPictureFactor() - 1.0); timing.viPart += part; cycles += part; }
++  f64 viPart = min(timing.viPart, cycles) * timing.calibration;  //what the VI adds to this command while it reads the picture
++  timing.viPart = 0.0;
++  timing.pendingVi += viPart * 3.0;
+   cycles = cycles * timing.calibration + measured;  //'measured' is in real clocks already
+   timing.frameCycles += (u64)cycles;
+   timing.accumulated += cycles * 3.0;
+@@ -122,7 +125,7 @@ auto RDP::timingCpu(u32 kind, f64 clocks, u32 address) -> f64 {
+     if(megabyte == (timing.colorAddress & 0xffffff) >> 20) place = timing.cpuColor[kind];
+     else if((timing.depthSeen || timing.depthLast) && megabyte == (timing.depthAddress & 0xffffff) >> 20) place = timing.cpuDepth[kind];
+     else if(!command.source && megabyte == (u32)command.current >> 20) place = timing.cpuList[kind];
+-    if(vi.active() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) extra = vi.io.antialias < 2 ? timing.cpuVi[kind] : timing.cpuViAA2[kind];
++    if(vi.picture() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) extra = (vi.io.antialias < 2 ? timing.cpuVi[kind] : timing.cpuViAA2[kind]) * timing.viPicture;
+   }
+   //what the RDP did in the last finished frame decides what a transfer in an unused megabyte costs it (timingLoss)
+   if(kind == CpuInstructionFill) clocks = timing.cpuLossInstruction;
+@@ -191,20 +194,32 @@ auto RDP::timingMode() -> u32 {
+   return timing.mode = mode;
+ }
+ 
+-//how much the VI's framebuffer fetch slows the RDP in the current VI mode (see rdp.hpp)
++//how much the VI's framebuffer fetch slows the RDP just now: nothing while the VI is outside the picture
+ auto RDP::viModeFactor() -> f64 {
++  return vi.picture() ? viPictureFactor() : 1.0;
++}
++
++//a span or a load in AA modes 0 / 1 / 3: priced as if the VI read the picture all the time; the part it adds is kept
++//apart (timing.pendingVi) and not spent while the VI is outside the picture (timingStep)
++auto RDP::timingVi(f64 cost) -> f64 {
++  if(vi.io.antialias == 2) return cost;  //AA mode 2: on the whole list (timingAdd)
++  f64 part = cost * (viPictureFactor() - 1.0);
++  timing.viPart += part;
++  return cost + part;
++}
++
++//how much the VI's framebuffer fetch slows the RDP in the current VI mode while it reads the picture (see rdp.hpp)
++auto RDP::viPictureFactor() -> f64 {
+   if(!vi.active()) return 1.0;
+   f64 f = vi.io.antialias == 3 ? timing.viFactorAA3 : vi.io.antialias == 2 ? timing.viFactorAA2 : timing.viFactorAA0;
+   u32 bytes = ((u32)vi.io.width ? (u32)vi.io.width : 320u) * (vi.io.colorDepth == 3 ? 4u : 2u);
+   if(bytes > 640 && vi.io.antialias < 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScale * ((f64)bytes / 640.0 - 1.0));
+-  return f;
++  return 1.0 + (f - 1.0) * timing.viPicture;
+ }
+ 
+ //what a span or load costs in a running game relative to the idle-console tables
+ auto RDP::timingScale(bool memoryBound) -> f64 {
+-  f64 f = memoryBound ? timing.contentionZ : timing.contentionPlain;
+-  if(vi.io.antialias != 2) f *= viModeFactor();  //AA mode 2: on the whole list (timingAdd)
+-  return f;
++  return memoryBound ? timing.contentionZ : timing.contentionPlain;  //the VI's part: timingVi
+ }
+ 
+ //what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (rdp_timing v56)
+@@ -293,7 +308,7 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+   //other bus masters (CPU, RSP, VI) lengthen every span: measured as a factor on the span
+   f64 pipe = pixels * timing.pipeCycles;
+   if(cost < pipe) cost = pipe;
+-  cost *= timingScale(timing.memoryBound);
++  cost = timingVi(cost * timingScale(timing.memoryBound));
+   if(timing.memoryBound) {
+     cost += timing.spanPenalty;
+     //with the pixels outside the scissor charged (timingTriangle), the per-span prices can follow the
+@@ -558,9 +573,25 @@ auto RDP::timingSyncFull() -> void {
+ //advance the RDP by up to 'clocks' system clocks of queued work; returns the clocks consumed
+ auto RDP::timingStep(u32 clocks) -> u32 {
+   if(timing.pending == 0) return 0;
+-  if((u64)clocks > timing.pending) clocks = (u32)timing.pending;
+-  timing.pending -= clocks;
+-  timing.completed += clocks;
++  u64 work = clocks;
++  if(timing.pendingVi > 0.0 && !vi.picture()) {
++    //the VI is outside the picture: the queued work goes without the part the VI's traffic adds to it
++    f64 rest = max(1.0, (f64)timing.pending - timing.pendingVi);
++    f64 done = clocks * ((f64)timing.pending / rest) + timing.viCarry;
++    work = (u64)done;
++    timing.viCarry = done - (f64)work;
++    if(work > timing.pending) {
++      clocks = max(1u, (u32)(rest + 0.5));  //what is left takes its time without the VI's part
++      work = timing.pending;
++      timing.viCarry = 0.0;
++    }
++  } else if(work > timing.pending) {
++    work = timing.pending;
++    clocks = (u32)work;
++  }
++  timing.pendingVi = work < timing.pending ? timing.pendingVi * (1.0 - (f64)work / (f64)timing.pending) : 0.0;
++  timing.pending -= work;
++  timing.completed += work;
+   while(timing.syncQueued && timing.completed >= timing.syncTargets[0]) {
+     timing.syncQueued--;
+     for(u32 n : range(timing.syncQueued)) timing.syncTargets[n] = timing.syncTargets[n + 1];
+@@ -658,7 +689,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+   case 0x30: { //Load_TLUT
+     s32 s0 = n12(op >> 44) >> 2, s1 = n12(op >> 12) >> 2;
+     u32 count = s1 >= s0 ? s1 - s0 + 1 : 0;
+-    f64 cost = rdp_tm_load_tlut(count) * timingScale(false);
++    f64 cost = timingVi(rdp_tm_load_tlut(count) * timingScale(false));
+     timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+     timingAdd(cost);
+   } break;
+@@ -667,7 +698,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+     s32 s0 = n12(op >> 44), s1 = n12(op >> 12);
+     u32 texels = s1 >= s0 ? s1 - s0 + 1 : 0;
+     u32 bytes = texelBytes2(texels) >> 1;
+-    f64 cost = rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false);
++    f64 cost = timingVi(rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false));
+     timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+     timingAdd(cost);
+   } break;
+@@ -684,7 +715,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+     //rows of the source image further apart than 512 / 1024 bytes cost 1.2 / 2.3 clocks more each (rdp_timing v34: a 32x32
+     //RGBA16 tile out of a 320-pixel-wide image +4.8%, out of a 640-pixel-wide one +8.5%)
+     f64 strideCost = stride >= 1024 ? timing.loadStrideWide : stride >= 512 ? timing.loadStride : 0.0;
+-    f64 cost = (rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false);
++    f64 cost = timingVi((rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false));
+     timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+     timingAdd(cost);
+   } break;
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 2fd0719c..e84acc2d 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -1,5 +1,5 @@
+ auto RSP::dmaQueue(u32 clocks, Thread& thread) -> void {
+-  if(rdp.timing.enable && vi.active()) clocks = (u32)(clocks * (vi.io.antialias < 2 ? DmaViFactor : DmaViFactorAA3));
++  if(rdp.timing.enable && vi.picture()) clocks = (u32)(clocks * (1.0 + ((vi.io.antialias < 2 ? DmaViFactor : DmaViFactorAA3) - 1.0) * rdp.timing.viPicture));  //only while the VI reads the picture
+   dma.clock = (Thread::clock - thread.clock) - clocks;
+ }
+ 
+@@ -34,12 +34,12 @@ auto RSP::dmaContention(bool start) -> f64 {
+     bool depth = t.depthSeen || t.depthLast;  //the frame being drawn, or the one before it, uses the depth buffer
+     if(megabyte == (t.colorAddress & 0xffffff) >> 20) clocks += t.dmaColor;
+     else if(depth && megabyte == (t.depthAddress & 0xffffff) >> 20) clocks += t.dmaDepth;
+-    if(vi.active() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) {
++    if(vi.picture() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) {
+       if(vi.io.antialias < 2) extra = (dma.busy.read ? t.dmaVi : t.dmaViWrite) + units * t.dmaViUnit + (gap >= 38 ? (dma.busy.read ? t.dmaViGap : t.dmaViGapWrite) : 0.0);
+       else extra = t.dmaViAA2 + units * t.dmaViUnitAA2 + (gap >= 38 && dma.busy.read ? t.dmaViGapAA2 : 0.0);
+     }
+   }
+-  return clocks * rdp.contendScale(RDP::ContendDma) + extra;
++  return clocks * rdp.contendScale(RDP::ContendDma) + extra * t.viPicture;
+ }
+ 
+ auto RSP::dmaTransferStart(Thread& thread) -> void {
+diff --git a/ares/n64/vi/vi.hpp b/ares/n64/vi/vi.hpp
+index 043e9f2c..b49710ba 100644
+--- a/ares/n64/vi/vi.hpp
++++ b/ares/n64/vi/vi.hpp
+@@ -23,6 +23,14 @@ struct VI : Thread, Memory::RCP<VI> {
+   auto refresh() -> void;
+   auto power(bool reset) -> void;
+   auto active() -> bool { return io.colorDepth != 0; }
++  //is the VI reading the frame buffer just now? Only on the lines of the picture (VI_V_VIDEO, in half-lines): during
++  //vertical blanking it leaves RDRAM alone. On the console the RDP and the RSP run at their VI-off speed for those 0.097 VI
++  //of every field (task_timing v26: the progress of a task replayed with the VI on, sampled every 1/50 VI)
++  auto picture() -> bool {
++    if(!active()) return false;
++    u32 half = (u32)io.vcounter << 1 | (u32)io.field;
++    return half >= (u32)io.vstart && half < (u32)io.vend;
++  }
+ 
+   //io.cpp
+   auto readWord(u32 address, Thread& thread) -> u32;
+-- 
+2.43.0
+

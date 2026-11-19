@@ -5,9 +5,9 @@ Subject: [PATCH 9999] harness: headless verification harness and core instrument
 
 Not for upstream: the headless/ runner (frame-limited runs with RAM watches, input
 scripts, RAM dumps, RDP list dumps), the T_* environment knobs for every timing
-constant, the ARES_*_LOG traces, and the experimental models (RDP edge walker,
-per-triangle costs, Z coverage estimator) used to verify series v13 against the
-console measurements. Apply after 0017 with `git apply`.
+constant, the ARES_*_LOG traces (incl. the BYTES RDRAM-traffic line), and the experimental models (RDP edge walker,
+per-triangle costs, Z coverage estimator) used to verify series v26 against the
+console measurements. Apply after 0032 with `git apply`.
 
 ---
 diff --git a/CMakeLists.txt b/CMakeLists.txt
@@ -39,6 +39,18 @@ index 0cb69e93..f04a01a2 100644
 -add_subdirectory(.github)
  add_subdirectory(cmake)
  return()
+diff --git a/ares/n64/ai/io.cpp b/ares/n64/ai/io.cpp
+index 37e54efe..e068df1d 100644
+--- a/ares/n64/ai/io.cpp
++++ b/ares/n64/ai/io.cpp
+@@ -39,6 +39,7 @@ auto AI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+     if(io.dmaCount < 2) {
+       if(io.dmaCount == 0) mi.raise(MI::IRQ::AI);
+       io.dmaLength[io.dmaCount] = length;
++      { static bool aiLog = getenv("ARES_IMG_LOG") != nullptr; if(aiLog) fprintf(stderr, "AILEN %06x len=%u hz=%u\n", (u32)io.dmaAddress[io.dmaCount], (u32)length, (u32)dac.frequency); }  //HARNESS
+       io.dmaOriginPc[io.dmaCount] = cpu.ipu.pc;
+       io.dmaCount++;
+     }
 diff --git a/ares/n64/cartridge/cartridge.hpp b/ares/n64/cartridge/cartridge.hpp
 index cc24e6ed..82c28cc1 100644
 --- a/ares/n64/cartridge/cartridge.hpp
@@ -85,7 +97,7 @@ index cc24e6ed..82c28cc1 100644
        piViewOffset = address - 0x1000'0000;
        piViewWritable = false;
 diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
-index cdec3a4c..98f6064f 100644
+index e0a2ab4f..5353c924 100644
 --- a/ares/n64/cpu/cpu.cpp
 +++ b/ares/n64/cpu/cpu.cpp
 @@ -81,9 +81,11 @@ auto CPU::flushCount() -> void {
@@ -101,7 +113,7 @@ index cdec3a4c..98f6064f 100644
    Thread::clock = 0;
    countClock = 0;
    jitClockTarget = 0;
-@@ -190,48 +192,47 @@ auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {
+@@ -190,6 +192,7 @@ auto CPU::instructionPrologue(u64 address, u32 instruction) -> void {
  }
  
  auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
@@ -109,18 +121,31 @@ index cdec3a4c..98f6064f 100644
    icache.line(vaddr).fill(paddr, *this);
  }
  
- auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
-   u32 total = 0;
--  if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
+@@ -201,42 +204,53 @@ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind, u32 address) -> u32
+     viStallCarry -= stall;
+     total += stall;
+   }
 -  if(rdp.timing.enable && rsp.dma.busy.any()) {  //an SP DMA in flight: the two transfers delay each other (rsp_timing v19)
 -    rsp.dma.clock -= RSP::DmaCpuPenaltyClocks;
 -    total += RSP::DmaCpuStallCycles;
 -  }
-+  if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch (v12)
 +  if(rdp.timing.enable && rsp.dma.busy.any()) { rsp.dma.clock -= rsp.dmaCpuPenalty; total += rsp.dmaCpuStall; }  //HARNESS: v19: SP DMA and CPU line transfers delay each other
    if(rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze) {
 +    stallCycles += cycles;  //HARNESS counter
-     rdp.timingDelay(rdpClocks * rdp.contendScale());  //and the RDP loses the bus for the transfer
++    if(kind <= RDP::CpuInstructionFill) {  //HARNESS ARES_CPU_MIB=1: where the CPU's cache fills beside a busy RDP are
++      static struct Hist { u64 n[2][16] = {}, mib[2][8] = {}; bool on = getenv("ARES_CPU_MIB");
++        ~Hist() { if(!on) return; for(u32 d : range(2)) { for(u32 c : range(16)) if(n[d][c]) fprintf(stderr, "CPUMIB %s list%d color%d depth%d vi%d %llu\n", d ? "icache" : "dcache", c & 1, c >> 1 & 1, c >> 2 & 1, c >> 3 & 1, (unsigned long long)n[d][c]);
++          for(u32 m : range(8)) if(mib[d][m]) fprintf(stderr, "CPUMIBN %s mib%d %llu\n", d ? "icache" : "dcache", m, (unsigned long long)mib[d][m]); } } } hist;
++      if(hist.on && address < 0x80'0000) {
++        auto& t = rdp.timing; u32 m = address >> 20 & 7, c = 0;
++        if(!rdp.command.source && m == ((u32)rdp.command.current >> 20 & 7)) c |= 1;
++        if(m == (t.colorAddress >> 20 & 7)) c |= 2;
++        if((t.depthSeen || t.depthLast) && m == (t.depthAddress >> 20 & 7)) c |= 4;
++        if(vi.active() && m == ((u32)vi.io.dramAddress >> 20 & 7)) c |= 8;
++        hist.n[kind == RDP::CpuInstructionFill][c]++; hist.mib[kind == RDP::CpuInstructionFill][m]++;
++      }
++    }
+     rdp.timingDelay(rdp.timingCpu(kind, rdpClocks, address));  //and the RDP loses the bus for the transfer
      total += cycles;
    }
    return total;
@@ -164,13 +189,13 @@ index cdec3a4c..98f6064f 100644
    if(!next) return cycles;
    auto nop = next >> 26;
    if(isStore(op) && (isLoad(nop) || isStore(nop) || nop == 0x2f)) return cycles + 1;  //the store occupies the data cache for one more cycle
-@@ -252,29 +253,13 @@ auto CPU::hazardCycles(u32 instruction, u32 next) -> u32 {
+@@ -257,29 +271,13 @@ auto CPU::hazardCycles(u32 instruction, u32 next) -> u32 {
    return cycles;
  }
  
--auto CPU::icacheBusyStall() -> u32 {
+-auto CPU::icacheBusyStall(u32 paddr) -> u32 {
 -  viStallCycles = ViStallIFill;
--  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI);
+-  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::CpuInstructionFill, paddr);
 -  viStallCycles = ViStallFill;
 -  return r;
 -}
@@ -181,7 +206,7 @@ index cdec3a4c..98f6064f 100644
 -  wbPending = false;
 -  viStallCycles = ViStallWriteBack;
 -  s64 now = busNow();
--  busFreeAt = (busFreeAt > now ? busFreeAt : now) + (DCacheWriteBackCycles + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
+-  busFreeAt = (busFreeAt > now ? busFreeAt : now) + (DCacheWriteBackCycles + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW, RDP::CpuWriteBack, wbAddress)) * 2;
 -  viStallCycles = ViStallFill;
 -}
 -
@@ -198,22 +223,22 @@ index cdec3a4c..98f6064f 100644
      step((u32)(wbDone[wbHead] - now)); now = busNow();
      wbHead = wbHead + 1 & 3; wbCount--;
    }
-@@ -288,9 +273,12 @@ auto CPU::postWrite(u32 paddr) -> void {
+@@ -293,9 +291,12 @@ auto CPU::postWrite(u32 paddr) -> void {
    busFreeAt = done;
  }
  
-+auto CPU::icacheBusyStall() -> u32 { u32 save = viStallCycles; viStallCycles = viStallI; u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI); viStallCycles = save; return r; }
++auto CPU::icacheBusyStall(u32 paddr) -> u32 { u32 save = viStallCycles; viStallCycles = viStallI; u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::CpuInstructionFill, paddr); viStallCycles = save; return r; }
 +
  //the recompiler's inline instruction cache fill: the stall part of the fill time
  auto CPU::icacheStall() -> void {
 -  busWaitFill();
 +  profile.icacheMisses++;  //HARNESS: the recompiler's inline fill
 +  if(wbSync >= 0) busWaitFill();
-   if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI)) step(cycles * 2);
- }
- 
+   //the fill is at the program counter; a mapped address (not kseg0 / kseg1) is taken as unknown
+   u32 pc = (u32)ipu.pc;
+   u32 address = pc >= 0x8000'0000 && pc < 0xc000'0000 ? pc & 0x1fff'ffff : ~0u;
 diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
-index 22d7a0e4..2b79d590 100644
+index ffc813ff..e503c123 100644
 --- a/ares/n64/cpu/cpu.hpp
 +++ b/ares/n64/cpu/cpu.hpp
 @@ -1,3 +1,4 @@
@@ -221,7 +246,7 @@ index 22d7a0e4..2b79d590 100644
  //NEC VR4300
  
  struct CPU : Thread {
-@@ -54,60 +55,46 @@ struct CPU : Thread {
+@@ -54,62 +55,48 @@ struct CPU : Thread {
    auto raiseCoprocessor1Exception() -> void;
    auto icacheFillLine(u64 vaddr, u32 paddr) -> void;
  
@@ -233,13 +258,15 @@ index 22d7a0e4..2b79d590 100644
 +  //cache line transfers wait for RDRAM behind the RDP while it is drawing (measured on
 +  //hardware with rdp_timing v8: an instruction cache fill takes 10 CPU cycles longer, a
 +  //data cache fill 4, a data cache write-back 12; otherwise the CPU is not slowed down)
-   auto rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32;
+   auto rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind, u32 address = ~0u) -> u32;  //kind: RDP::CpuDataFill ...; address: RDRAM address, ~0 = unknown
++  u32  wbAddress = ~0u;        //RDRAM address of the line waiting in the write buffer
    auto icacheStall() -> void;
-   auto icacheBusyStall() -> u32;
+   auto icacheBusyStall(u32 paddr) -> u32;
 -  enum : u32 { ICacheFillStall = 6, DCacheFillStall = 5, DCacheWriteBackStall = 11 };
 -  enum : u32 { ICacheFillCycles = 48, DCacheFillCycles = 40, DCacheWriteBackCycles = 25 };  //cpu_timing v14: fill 41 incl. the load, write-back 25
 -  enum : u32 { ViStallFill = 6, ViStallIFill = 6, ViStallWriteBack = 2 };
 -  u32 viStallCycles = ViStallFill;  //the VI part of the stall for the transfer in progress
+-  f64 viStallCarry = 0.0;           //its fraction of a cycle carried to the next transfer
 -  //The write buffer (cpu_timing v14/v18). Stores that leave the CPU (uncached RDRAM, RCP registers,
 -  //dirty cache lines) are posted to a 4-entry buffer and drained in order: an uncached RDRAM word
 -  //occupies the bus for 16 cycles (a 16-byte line 17), an SP/DP register write 10, an MI register 2.
@@ -255,6 +282,7 @@ index 22d7a0e4..2b79d590 100644
 -  s64 clockEpoch = 0;          //Thread::clock is reset at every synchronize(); epoch + clock is monotonic
 -  s64 busFreeAt = 0;           //when the last posted write leaves the bus
 -  s64 wbDone[WriteBufferEntries] = {}; u32 wbHead = 0, wbCount = 0;
+-  u32  wbAddress = ~0u;        //RDRAM address of the line waiting in the write buffer
 -  bool wbPending = false;      //a dirty line waits to be written back after the fill that evicted it
 -  auto busNow() const -> s64 { return clockEpoch + Thread::clock; }
 -  auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); wbCount = 0; }
@@ -292,6 +320,7 @@ index 22d7a0e4..2b79d590 100644
 +  bool hazardModel = false;  //HARNESS: v11-measured pipeline hazards (load-use +1, store then memory op +1, mfc0 +1, nullified likely slot 1)
    auto hazardCycles(u32 instruction, u32 next) -> u32;
 +  u32 viStallCycles = 6, viStallI = 6, viStallW = 2;  //HARNESS: extra cycles per transfer while the VI is in an AA mode (v12)
++  f64 viStallCarry = 0.0;           //its fraction of a cycle carried to the next transfer
 +  //HARNESS: write buffer model: a write-back only costs the CPU 'wbSync' cycles; the transfer itself
 +  //occupies the bus for cpuFillW (+ stall) cycles and the next line transfer waits for it
 +  s32 wbSync = -1;             //-1: write-backs are synchronous (ares default)
@@ -315,7 +344,7 @@ index 22d7a0e4..2b79d590 100644
    auto power(bool reset) -> void;
  
    struct Pipeline {
-@@ -127,7 +114,7 @@ struct CPU : Thread {
+@@ -129,7 +116,7 @@ struct CPU : Thread {
      auto branch(u64 address) -> void { nextpc = address; nstate |= DelaySlot | EndBlock; }
      auto noBranch() -> void { nstate |= DelaySlot; }
      auto exception() -> void { state |= EndBlock; }
@@ -324,19 +353,19 @@ index 22d7a0e4..2b79d590 100644
      auto begin() -> void {
        nstate = 0;
        pc = nextpc;
-@@ -260,8 +247,8 @@ struct CPU : Thread {
+@@ -262,8 +249,8 @@ struct CPU : Thread {
        }
  
        auto fill(u32 paddr, CPU& cpu) -> void {
 -        cpu.busWaitFill();
--        cpu.step((ICacheFillCycles + cpu.icacheBusyStall()) * 2);
+-        cpu.step((ICacheFillCycles + cpu.icacheBusyStall(paddr)) * 2);
 +        if(cpu.wbSync >= 0) cpu.busWaitFill();
-+        cpu.step((cpu.cpuFillI + cpu.icacheBusyStall()) * 2);
++        cpu.step((cpu.cpuFillI + cpu.icacheBusyStall(paddr)) * 2);
          const u32 tag = paddr & ~0x0000'0fffu;
          tagKey = tag;
          setValid(true);
 diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
-index bd552f9d..90ae0383 100644
+index 32cf800e..df1a8088 100644
 --- a/ares/n64/cpu/dcache.cpp
 +++ b/ares/n64/cpu/dcache.cpp
 @@ -4,10 +4,13 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
@@ -344,20 +373,20 @@ index bd552f9d..90ae0383 100644
  
  auto CPU::DataCache::Line::fill(u32 paddr) -> void {
 -  cpu.busWaitFill();
--  cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu)) * 2);
+-  cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu, RDP::CpuDataFill, paddr)) * 2);
 -  //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
 -  if(cpu.wbPending) cpu.postWriteBack();
 +  if(cpu.wbSync >= 0) cpu.busWaitFill();
-+  cpu.step((cpu.cpuFillD + cpu.rdpBusyStall(cpu.DCacheFillStall, rdp.timing.contendCpu)) * 2);
++  cpu.step((cpu.cpuFillD + cpu.rdpBusyStall(cpu.DCacheFillStall, rdp.timing.contendCpu, RDP::CpuDataFill, paddr)) * 2);
 +  if(cpu.wbSync >= 0 && cpu.wbPending) {
 +    //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
 +    cpu.wbPending = false;
-+    { u32 save = cpu.viStallCycles; cpu.viStallCycles = cpu.viStallW; { s64 now = cpu.busNow(); cpu.busFreeAt = (cpu.busFreeAt > now ? cpu.busFreeAt : now) + (cpu.cpuFillW + cpu.rdpBusyStall(cpu.DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2; } cpu.viStallCycles = save; }
++    { u32 save = cpu.viStallCycles; cpu.viStallCycles = cpu.viStallW; { s64 now = cpu.busNow(); cpu.busFreeAt = (cpu.busFreeAt > now ? cpu.busFreeAt : now) + (cpu.cpuFillW + cpu.rdpBusyStall(cpu.DCacheWriteBackStall, rdp.timing.contendCpuW, RDP::CpuWriteBack, cpu.wbAddress)) * 2; } cpu.viStallCycles = save; }
 +  }
    const u32 tag = paddr & ~0x0000'0fffu;
    dirty  = 0;
    tagKey = tag;
-@@ -16,9 +19,12 @@ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+@@ -16,11 +19,14 @@ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
  }
  
  auto CPU::DataCache::Line::writeBack() -> void {
@@ -368,12 +397,15 @@ index bd552f9d..90ae0383 100644
 +    if(cpu.wbPending) cpu.busWait();  //two evictions without a fill between them: the buffer holds one line
 +    cpu.step(cpu.wbSync * 2);
 +    cpu.wbPending = true;
++    cpu.wbAddress = (tagKey & ~0x0000'0fffu) | index;
 +  } else
-+  { u32 save = cpu.viStallCycles; cpu.viStallCycles = cpu.viStallW; cpu.step((cpu.cpuFillW + cpu.rdpBusyStall(cpu.DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2); cpu.viStallCycles = save; }
++  { u32 save = cpu.viStallCycles; cpu.viStallCycles = cpu.viStallW; cpu.step((cpu.cpuFillW + cpu.rdpBusyStall(cpu.DCacheWriteBackStall, rdp.timing.contendCpuW, RDP::CpuWriteBack, (tagKey & ~0x0000'0fffu) | index)) * 2); cpu.viStallCycles = save; }
    const u32 tag = tagKey & ~0x0000'0fffu;
+-  cpu.wbAddress = tag | index;
    cpu.busWriteBurst<DCache>(tag | index, words);
  }
-@@ -63,6 +69,7 @@ auto CPU::DataCache::read(u64 vaddr, u32 paddr) -> u64 {
+ 
+@@ -64,6 +70,7 @@ auto CPU::DataCache::read(u64 vaddr, u32 paddr) -> u64 {
      line.fill(paddr);
      self.profile.dcacheMisses++;
    } else {
@@ -381,7 +413,7 @@ index bd552f9d..90ae0383 100644
      self.profile.dcacheHits++;
    }
    return line.read<Size>(paddr);
-@@ -91,6 +98,7 @@ auto CPU::DataCache::write(u64 vaddr, u32 paddr, u64 data) -> void {
+@@ -92,6 +99,7 @@ auto CPU::DataCache::write(u64 vaddr, u32 paddr, u64 data) -> void {
      line.fill(paddr);
      self.profile.dcacheMisses++;
    } else {
@@ -711,7 +743,7 @@ index c5d31956..0fdaa8d3 100644
  
  auto CPU::LDC1(u8 ft, cr64& rs, s16 imm) -> void {
 diff --git a/ares/n64/cpu/interpreter-ipu.cpp b/ares/n64/cpu/interpreter-ipu.cpp
-index 4702eaa4..9a5b560e 100644
+index 4702eaa4..360a92ba 100644
 --- a/ares/n64/cpu/interpreter-ipu.cpp
 +++ b/ares/n64/cpu/interpreter-ipu.cpp
 @@ -242,10 +242,16 @@ auto CPU::CACHE(u8 operation, cr64& rs, s16 imm) -> void {
@@ -729,7 +761,7 @@ index 4702eaa4..9a5b560e 100644
 +      wbPending = false;
 +      busWait();  //the line leaves when the bus is free
 +      s64 now = busNow();
-+      busFreeAt = (busFreeAt > now ? busFreeAt : now) + (cpuFillW + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
++      busFreeAt = (busFreeAt > now ? busFreeAt : now) + (cpuFillW + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW, RDP::CpuWriteBack, wbAddress)) * 2;
 +    }
 +  }
  }
@@ -1373,7 +1405,7 @@ index 47719890..d7fd06c1 100644
      add64(ProfileDcacheHitsMem, ProfileDcacheHitsMem, imm(1));
    }
 diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
-index 632e64e7..395786cf 100644
+index 5348205d..e5df8e09 100644
 --- a/ares/n64/cpu/recompiler.cpp
 +++ b/ares/n64/cpu/recompiler.cpp
 @@ -680,10 +680,10 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
@@ -1400,7 +1432,7 @@ index 632e64e7..395786cf 100644
          if(fn < 0x30) ready[fd] = t + lat;
          t += issue;
        } else if(op == 0x31 || op == 0x35) {  //LWC1/LDC1
-@@ -780,8 +780,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+@@ -781,8 +781,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
        instructionCycles = 64 * 2;
      }
      emitDeferredCycles += instructionCycles;
@@ -1500,7 +1532,7 @@ index de726b67..8254ed9e 100644
    struct Debugger {
      //debugger.cpp
 diff --git a/ares/n64/rdp/io.cpp b/ares/n64/rdp/io.cpp
-index be0f086f..1b9ce4d0 100644
+index 3d2b3a38..d1753f8c 100644
 --- a/ares/n64/rdp/io.cpp
 +++ b/ares/n64/rdp/io.cpp
 @@ -15,18 +15,18 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
@@ -1532,15 +1564,20 @@ index be0f086f..1b9ce4d0 100644
        }
      }
      if(&thread == &cpu) cpu.forceSynchronize();
-@@ -45,6 +45,7 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
-     data.bit( 8) = 0;  //DMA busy
-     data.bit( 9) = command.endValid;
+@@ -49,9 +49,10 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
+     //output buffer again, never gets more than the buffer ahead of the RDP; with the bit cleared at the next DPC_END
+     //write it got up to five buffers ahead here and finished its task 3 to 8% early)
      data.bit(10) = command.startValid;
+-    if(timing.enable && timing.pending) {
+-      for(u32 n : range(timing.rangeCount)) { auto& r = timing.ranges[(timing.rangeHead + n) & 2047]; if(r.fresh && r.before > timing.completed) { data.bit(10) = 1; break; } }
++    if(fifoModel && startModel && timing.enable && timing.pending) {  //HARNESS T_STARTV=0
++      for(u32 n : range(fifoCount)) { auto& c = fifoChunks[(fifoHead + n) & 4095]; if(c.fresh && c.before > timing.completed) { data.bit(10) = 1; break; } }
+     }
 +    if(fifoModel == 1 && timing.enable && timing.completed < fifo.before) data.bit(9) = data.bit(10) = 1;  //HARNESS: END not yet accepted
      if(&thread == &cpu) cpu.forceSynchronize();
    }
  
-@@ -74,12 +75,18 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
+@@ -81,12 +82,18 @@ auto RDP::readWord(u32 address, Thread& thread) -> u32 {
    }
  
    debugger.ioDPC(Read, address, data);
@@ -1559,72 +1596,116 @@ index be0f086f..1b9ce4d0 100644
  
    if(address == 0) {
      //DPC_START
-@@ -94,13 +101,15 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+@@ -97,20 +104,22 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+   if(address == 1) {
+     //DPC_END
+     command.end = data.bit(0,23) & ~7;
+-    if(command.startValid) timing.rangeFresh = 1;
++    if(command.startValid) fifoFreshPending = 1;  //this range begins at a new DPC_START
+     if(command.startValid) {
        command.current = command.start;
        command.startValid = 0;
      }
--    Timing::Range range{command.current, command.end, timing.submitted, 0};
+-    Timing::Range range{command.current, command.end, timing.submitted, 0, 0};
 +    static bool aheadLog = getenv("ARES_AHEAD_LOG") != nullptr;  //HARNESS
 +    if(aheadLog && &thread == &rsp) fprintf(stderr, "AHEAD %llu %llu\n", (unsigned long long)timing.syncFullCount, (unsigned long long)timing.pending);
 +    { static bool endLog = getenv("ARES_END_LOG") != nullptr; if(endLog && command.source) fprintf(stderr, "END %03x..%03x dmem %016llx %016llx rdram700000 %016llx\n", (u32)command.current, (u32)command.end, (unsigned long long)rsp.dmem.read<Dual>(command.current), (unsigned long long)rsp.dmem.read<Dual>(command.current + 8), 0ULL); }  //HARNESS
 +    fifo.start = command.current; fifo.end = command.end; fifo.before = timing.submitted;  //HARNESS
      flushCommands();
 -    range.after = timing.submitted;
+-    range.fresh = timing.rangeFresh;
 -    if(timing.enable && range.after > range.before) {
 -      auto& t = timing;
+-      t.rangeFresh = 0;
 -      if(t.rangeCount == 2048) { t.rangeHead = (t.rangeHead + 1) & 2047; t.rangeCount--; }
 -      t.ranges[(t.rangeHead + t.rangeCount) & 2047] = range; t.rangeCount++;
 +    fifo.after = timing.submitted;
++    fifo.fresh = fifoFreshPending;
 +    if(fifoModel && fifo.after > fifo.before) {
++      fifoFreshPending = 0;
 +      if(fifoCount == 4096) { fifoHead = (fifoHead + 1) & 4095; fifoCount--; }
 +      fifoChunks[(fifoHead + fifoCount) & 4095] = fifo; fifoCount++;
      }
      if(&thread == &cpu) cpu.forceSynchronize();
    }
 diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
-index 7f38701e..a29765e5 100644
+index 61c3b446..2ac480a6 100644
 --- a/ares/n64/rdp/rdp.cpp
 +++ b/ares/n64/rdp/rdp.cpp
-@@ -28,7 +28,6 @@ auto RDP::crash(const char *reason) -> void {
-   command.bufferBusy = 1;
+@@ -29,9 +29,6 @@ auto RDP::crash(const char *reason) -> void {
    timing.pending = 0;
+   timing.pendingVi = timing.viPart = timing.viCarry = 0.0;
    timing.syncQueued = 0;
 -  timing.rangeCount = 0;
+-  timing.rangeFresh = 0;
+-  timing.depthSeen = timing.depthLast = 0;
  }
  
  auto RDP::main() -> void {
-@@ -37,7 +36,9 @@ auto RDP::main() -> void {
+@@ -40,9 +37,10 @@ auto RDP::main() -> void {
      u32 clocks = (u32)min<s64>(-Thread::clock, 1 << 24);
      if(timing.pending && !command.freeze && !command.crashed) {
        clocks = timingStep(clocks);
+-      //the RSP running beside the RDP costs it a share of that time, whatever the RSP executes (task_timing v23)
+-      if(!rsp.status.halted) timingDelay(clocks / 3.0 * timing.rspBeside * (1.0 + (viModeFactor() - 1.0) * timing.rspBesideVi));
++      if(!rsp.status.halted) timingDelay(clocks / 3.0 * timing.rspBeside * (1.0 + (viModeFactor() - 1.0) * timing.rspBesideVi));  //the RSP running beside the RDP (task_timing v23)
 +      timing.busyUnits += clocks;  //HARNESS
      }
 +    timing.elapsedUnits += clocks;  //HARNESS
      step(clocks);
-     command.clock += clocks / 3;
+     //DPC_CLOCK counts RCP clocks (3 system clocks). The steps above are bounded by the work in flight, so the
+     //remainder of each has to carry over: dropping it made the register run 1.7-2.5% slow whenever the RDP was
+@@ -50,6 +48,7 @@ auto RDP::main() -> void {
+     timing.clockRemainder += clocks;
+     command.clock += timing.clockRemainder / 3;
+     timing.clockRemainder %= 3;
++    if(!clockFix) timing.clockRemainder = 0;  //HARNESS T_CLKFIX=0: the truncating count of series v2-v15
    }
+ }
+ 
 diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
-index 465dec4a..46938fe9 100644
+index e05cb456..dcdf8da9 100644
 --- a/ares/n64/rdp/rdp.hpp
 +++ b/ares/n64/rdp/rdp.hpp
-@@ -84,6 +84,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
-   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
-   auto timingAdd(f64 cycles) -> void;
+@@ -80,10 +80,10 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingMode() -> u32;
+   auto timingScale(bool memoryBound) -> f64;
+   auto viModeFactor() -> f64;
+-  enum : u32 { ContendDma, ContendCpu };  //who took the bus: an SP DMA, a CPU transfer
++  enum : u32 { ContendDma, ContendCpu, ContendCpuI };  //who took the bus: an SP DMA, a CPU data transfer, a CPU instruction cache fill
+   auto contendScale(u32 kind) -> f64;
+   auto viPictureFactor() -> f64;
+-  auto timingVi(f64 cost) -> f64;
++  auto timingVi(f64 cost, bool memoryBound = false) -> f64;
+   auto timingLoad(f64 cost) -> f64;
+   enum : u32 { CpuDataFill, CpuInstructionFill, CpuWriteBack, CpuUncachedWrite };
+   auto timingCpu(u32 kind, f64 clocks, u32 address) -> f64;
+@@ -92,7 +92,16 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
+   auto timingPlacement(s32 row) -> f64;
+   auto timingAudio(u32 address) -> void;
++  u32 viWholeAA2 = 1, audioModel = 1;  //HARNESS T_VIWAA2 / T_AI
++  u32 placeModel = 1; f64 placeClocks = 0.0;  //HARNESS T_PLACE
    auto timingDelay(f64 cycles) -> void;
 +  u64 dpcRspReads[8] = {}, dpcRspWrites[8] = {};  //HARNESS
-+  u32 rasterModel = 0; u32 widenModel = 1; u32 zNarrow = 16; u32 viRmwOnly = 0;  //HARNESS T_VIRMW=1: the VI factor on read-modify-write spans only (0016, reverted by 0017: the v40 probe shows the VI had stopped)  //HARNESS T_RASTER, T_ZNARROW (default = 0012: depth-test savings only for spans up to 16 px)
++  u32 rasterModel = 0; u32 widenModel = 1; u32 zNarrow = 16; u32 viRmwOnly = 0; u32 viClass = 0; u32 clipModel = 1; f64 zcmpBlendSpan = 0.0; u32 zcbModel = 1; u32 triFloor = 1; u32 model15 = 1; f64 zWide = 1.0; u32 clockFix = 1; u32 clockScaleDelay = 0; f64 widenMin = 16.0; u32 widenAll = 0; u32 cvgModel = 0; f64 cvg0Row = 11.0; u64 cvg0Rows = 0; u32 triHistN[4][8] = {}, triHistS[4][8] = {}, triHistP[4][8] = {}, triHistA[4][8] = {}; f64 triHistC[4][8] = {};  //HARNESS T_CLIPMODEL / T_ZCB / T_ZCBMODEL / T_TRIFLOOR (1 = series v14)  //HARNESS T_VIRMW=1: the VI factor on read-modify-write spans only (0016, reverted by 0017: the v40 probe shows the VI had stopped)  //HARNESS T_RASTER, T_ZNARROW (default = 0012: depth-test savings only for spans up to 16 px)
 +  f64 atomicCost = 20.0; f64 aa1Span = 3.5;  //HARNESS T_ATOMIC / T_AA1 (defaults = 0012)
 +  f64 triOverhead = -1.0; f64 triSpanPenalty = 15.0; f64 spanWide = 0.0;  //HARNESS: T_TRIOV / T_TRISP / T_SPWIDE (rdp_timing v22 W)
 +  u32 viWhole = 0;  //HARNESS: 1 = VI factor applied to the whole list instead of spans/loads only
 +  u32 curQuantum = 8; u32 fifoModel = 0;  //HARNESS: 1 = END accepted only when the previous range is drained (+CURRENT progress), 2 = CURRENT progress only
-+  struct FifoChunk { u32 start, end; u64 before, after; }; FifoChunk fifo; FifoChunk fifoChunks[4096]; u32 fifoHead = 0, fifoCount = 0;  //HARNESS
++  struct FifoChunk { u32 start, end; u64 before, after; u32 fresh; }; u32 fifoFreshPending = 0, startModel = 1; FifoChunk fifo; FifoChunk fifoChunks[4096]; u32 fifoHead = 0, fifoCount = 0;  //HARNESS
  
    //serialization.cpp
    auto serialize(serializer&) -> void;
-@@ -94,50 +101,38 @@ struct RDP : Thread, Memory::RCP<RDP> {
-   struct Timing {
-     //tunables
-     bool   enable = true;
+@@ -126,18 +135,17 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //playing as in the game (22047 Hz, its buffers in the megabyte of the output FIFO) take 0.0022 to 0.0062 VI longer with
+     //the VI off and 0.0036 to 0.0076 VI in the game's VI mode (task_timing v26); 14 clocks per sample while the RSP runs,
+     //scaled by the VI as an SP DMA is, gives 0.0023 to 0.0059 and 0.0029 to 0.0074
+-    f64    audioSampleListTask = 14.0;
++    f64    audioSampleListTask = 14.0;  //HARNESS T_AITASK
+     //a texture load whose source is in the megabyte the VI shows, AA modes 0 / 1: so much longer while the VI reads the
+     //picture (task_timing v26: DPC_TMEM +3.4% with the VI on the buffer the game showed, the other masters unchanged)
+-    f64    loadVi = 0.05;
 -    //the other bus masters are charged as they happen (timingDelay) instead of a fixed factor
 -    f64    contentionZ = 1.0;      //scale on read-modify-write spans (image read / depth) beyond the per-transfer charges below
 -    f64    contentionPlain = 1.0;  //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
@@ -1633,21 +1714,7 @@ index 465dec4a..46938fe9 100644
 -    //output line) +0.4%, mode 2 (resample) +3%, modes 0/1 (anti-aliased with divot: three lines per output
 -    //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
 -    f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
--    f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
--    f64    viContendScale = 2.4;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*2.4 at 320x16 AA0 (task_timing v20b: a
--                                   //CPU line fill costs the RDP 10.4 clocks with the VI off and 13.3 in the game's VI mode; v12 x1.25, v17 x1.42)
--    //RDP clocks lost to each transfer of another bus master while it has work in flight (rdp_timing v10, RDP drawing a game list):
--    f64    contendCpu = 10.0;      //a CPU data cache line fill (16 bytes): 10.4 with the VI off under a real task (task_timing v20b), 9.7 (v17), 11.7 (v10)
--    f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
--    f64    contendCpuW = 1.0;      //a CPU data cache write-back (16 bytes; rdp_timing v17: a random load+store loop costs the RDP about two fills' worth, not two fills and two write-backs)
--    f64    contendCpuU = 4.0;      //an uncached CPU write (rdp_timing v17: 2.7 with the VI off, 5 in the games' VI mode)
--    f64    contendDma = 1.2;       //per 8 bytes of SP DMA, plus contendDmaBase per transfer: the RDP only gets about 36 clocks of
--                                   //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
--    f64    contendDmaBase = 9.0;   //an isolated transfer costs a few clocks more than a back-to-back one: F3DEX2's 1164 DMAs per frame
--                                   //(168 B list fetches, 344 B output flushes, vertex and matrix loads) cost the RDP 51 clocks each with the VI
--                                   //off (task_timing v20b: 0.057 VI per frame; the v19b rule gives 45, this 48) and 47-71 in the game's VI mode
--                                   //depending on the console (PAL/NTSC); the contendScale factor (x1.28) sits between the two
--    f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
++    f64    loadVi = 0.05;  //HARNESS T_LOADVI
 +    f64    contentionZ = 1.13;     //measured slowdown of read-modify-write spans (image read / depth) by the RDRAM traffic of a running game
 +    f64    contentionPlain = 1.19; //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
 +    f64    viFactor = 0.0;         //old fixed factor (0 = use the VI mode model below)
@@ -1655,10 +1722,86 @@ index 465dec4a..46938fe9 100644
 +    f64    viWidthScaleAA2 = 0.0;  //HARNESS T_VIAA2WS (0016 tried 0.33; the game lists in the demo's mode say x1.03 whatever the line)
 +    f64    viWidthScale = 1.77;    //a 1280-byte line with divot/dedither: (1.324-1)/(1.117-1) = 2.77 = 1 + 1.77*(2-1) (v15)
 +    f64    viNtscScale = 1.0;      //NTSC line rate vs PAL (knob)
+     //The factors above (and the VI parts of the losses below) were measured as the time of a whole list or task with the VI
+     //on over that with it off. But the VI reads RDRAM only on the lines of the picture (VI::picture): a list that runs
+     //through a vertical blanking, 0.097 VI long, loses less of its time than one that runs between two of them. The
+@@ -146,44 +154,31 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //task shorter than 0.89 VI never sees one. Inside the picture every VI part is this much larger, outside it is gone
+     //(task_timing v26: with 1.16 the replays of six tasks keep their measured time).
+     f64    viPicture = 1.16;
+-    f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+-    //the per-transfer losses below grow with the VI factor, each kind of transfer by its own amount: loss x (1 + (factor - 1) x scale).
+-    //rdp_timing v56 (SP DMA and CPU loads beside four game lists, VI off and in the title's mode, the VI checked to be
+-    //running): at 320x240 16-bit AA 0/1 (factor 1.117) an SP DMA costs x1.19 to 1.28, a CPU data cache fill or store
+-    //x1.27 to 1.36, a CPU instruction cache fill x1.56 / 1.57; in the MGC demo's AA mode 2 (factor 1.03) x1.07 to 1.14,
+-    //x1.10 to 1.16, x1.24 / 1.38
+-    //an SP DMA whose RDRAM side is in the megabyte of the colour buffer / of the depth buffer (rdp_timing v57), and in
+-    //the megabyte the VI shows (clocks in that VI mode: AA 0/1 = base + per 8 bytes + after a pause; AA 2/3 likewise)
++    //rdp_timing v56: what a transfer costs the RDP grows with the VI factor by a different amount for each kind of transfer
++    //(320x240 16-bit AA modes 0/1, factor 1.117: SP DMA x1.23, CPU data x1.32, CPU instruction fill x1.57;
++    //the MGC demo's AA mode 2, factor 1.03: x1.09, x1.13, x1.31)
+     //the RSP executing beside the RDP costs it time, whatever the RSP does (task_timing v22 / v23: a microcode that only
+     //loops, with or without reading a DP or SP register, beside the RDP working through a finished list): 0.74 to 0.90%
+-    //of the time both run with the VI off, 1.26 to 1.59% in the 320x240 AA mode of BAR (VI factor 1.117); other VI
+-    //modes are scaled with the VI factor's excess (not measured)
+-    f64    rspBeside = 0.0082, rspBesideVi = 6.4;
+-    f64    dmaColor = 4.7, dmaDepth = 4.3;
+-    f64    dmaVi = 3.0, dmaViWrite = 1.9, dmaViUnit = 0.063, dmaViGap = 3.0, dmaViGapWrite = 1.9;
+-    f64    dmaViAA2 = 1.5, dmaViUnitAA2 = 0.023, dmaViGapAA2 = 1.1;
+-    f64    viContendDma = 1.94, viContendDmaAA2 = 3.2;
+-    f64    viContendCpu = 2.75, viContendCpuAA2 = 4.2;  //instruction fills as well: x1.33 to 1.38 / x1.10 to 1.14 with the VI showing another megabyte (rdp_timing v59)
+-    //RDP clocks lost to each transfer of another bus master while it has work in flight (real clocks, not scaled by
+-    //'calibration'). The CPU's four are rdp_timing v42 (the CPU loading the bus beside nine replayed game lists, VI off)
+-    //read again with the fixed DPC_CLOCK: the console loses 10.39 clocks per dependent data cache fill, 6.38 per
+-    //instruction cache fill, 13.63 per random store (a fill and a write-back), 23.56 per iteration of the mixed loop
+-    //and 2.58 per uncached write; these values give 10.46 / 6.27 / 13.53 / 23.24 / 2.62
+-    //rdp_timing v59: the CPU's transfers beside four game lists, each in a megabyte the list does not use, in the
+-    //megabyte of the command list, of the colour buffer and of the depth buffer (v42 had measured data fills in the
+-    //list's megabyte and instruction fills in an unused one). In an unused megabyte, VI off:
+-    f64    contendCpu = 9.95;      //a CPU data cache line fill (16 bytes): 8.1 to 10.8 (v42's ten lists: 10.4 in the list's megabyte)
+-    f64    contendCpuI = 6.1;      //a CPU instruction cache line fill (32 bytes): 5.0 to 6.8
+-    f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
+-    f64    contendCpuU = 2.6;      //an uncached CPU write
+-    //added by where the transfer is, for a data fill / an instruction fill / a write-back: the megabyte of the command
+-    //list (+0.3 to 0.9), of the colour buffer (data +2.3 to 2.7, instruction +4.3 to 7.0, a random store +2.9 to 6.2),
+-    //of the depth buffer of a list that uses depth (+1.3 / 1.7, +3.1 / 3.7, a store +2.9 / 4.4); and, in clocks of that
+-    //VI mode, the megabyte the VI shows (AA 0/1: +0.7, +1.8, a store +0.9; the MGC demo's AA 2: +0.4, +0.85, +0.6)
++    //of the time both run with the VI off, 1.26 to 1.59% in the 320x240 AA mode of BAR
++    //rdp_timing v59: what a CPU transfer costs by where it is (data fill / instruction fill / write-back)
+     f64    cpuList[3]  = {0.45, 0.5, 0.0};
+     f64    cpuColor[3] = {2.4, 5.8, 1.9};
+     f64    cpuDepth[3] = {1.5, 3.4, 2.15};
+     f64    cpuVi[3]    = {0.72, 1.8, 0.2}, cpuViAA2[3] = {0.38, 0.85, 0.2};
++    bool   cpuPlace = 1;           //HARNESS T_CPUPLACE=0: no placement terms and the instruction fill's own VI scale (series v22, with T_CPUX=10.4 T_CPUXI=5.8)
++    f64    rspBeside = 0.0082, rspBesideVi = 6.4;  //HARNESS T_RSPRUN / T_RSPRUNVI
++    f64    dmaColor = 4.7, dmaDepth = 4.3;  //rdp_timing v57: an SP DMA in the megabyte of the colour / depth buffer
++    f64    dmaVi = 3.0, dmaViUnit = 0.063, dmaViGap = 3.0, dmaViGapWrite = 1.9;  //in the megabyte the VI shows, AA 0/1 (clocks in that VI mode)
++    f64    dmaViAA2 = 1.5, dmaViUnitAA2 = 0.023, dmaViGapAA2 = 1.1;              //the same, AA 2/3
++    f64    dmaViWrite = 1.9;       //a write in the megabyte the VI shows, AA 0/1
++    bool   depthSeen = 0, depthLast = 0;  //a primitive of this / the previous frame used the depth buffer
++    bool   dmaPlace = 1;           //HARNESS T_DMAPLACE=0
++    f64    viContendDma = 1.94, viContendDmaAA2 = 3.2, viContendCpu = 2.75, viContendCpuAA2 = 4.2, viContendCpuI = 4.83, viContendCpuIAA2 = 10.3;
++    bool   viContendKinds = 1;     //HARNESS T_VIXK=0: the single viContendScale for every kind (series v19)
 +    f64    viContendScale = 1.6;   //per-transfer RDP loss grows with the VI factor: 1 + 0.155*1.6 = 1.25        //measured slowdown of read-modify-write spans with the VI scanning out a frame (write-only spans: none)
 +    f64    contendCpu = 12.0;      //RDP clocks lost to each CPU cache line transfer while drawing (rdp_timing v9 R)
 +    f64    contendCpuI = 12.0, contendCpuW = 12.0, contendCpuU = 4.0;  //HARNESS: instruction fills, write-backs, uncached writes (v17: 2.7 VI off / 5 VI on)
-+    f64    contendDma = 1.22;      //RDP clocks lost per 8 bytes of SP DMA while drawing (rdp_timing v7 D)
++    f64    contendDma = 1.22;      //RDP clocks lost per 8 bytes of SP DMA while drawing (rdp_timing v7 D)  //HARNESS T_DMAMODEL=0
+     //what a cache line fill costs the RDP also depends on what the RDP is doing meanwhile (rdp_timing v60 to v73: the
+     //CPU's fills beside 78 game lists and variants of them, and beside lists of one kind of work each, VI off, in a
+     //megabyte the list does not use; from v72 on read from DPC_PIPEBUSY, which stops when the RDP does, where DPC_CLOCK
+@@ -197,6 +192,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //constants 1.61 and 1.04.
+     f64    cpuLoad[2] = {3.8, 3.55};  //texture loads: data fill, instruction fill
+     f64    cpuRest[2] = {4.25, 4.2};  //triangle set-up, state commands and whatever else is not a span or a load
++    bool   cpuAct = 1;             //HARNESS T_CPUACT=0: the two constants for every list (series v23)
+     //RDP clocks lost to an SP DMA (rdp_timing v52; the CPU starts transfers of 64 B to 1 KiB beside four game lists):
+     //reading RDRAM 12.2 / 28.5 / 50.6 / 74.3 / 150 for 64 / 168 / 344 / 512 / 1024 B back to back, writing it
+     //11.2 / 25.5 / 48.7 / 71.5 / 143; after a pause the first costs more (168 B read: 28.3, 29.6, 30, 31.5, 32.5 after
+@@ -205,33 +201,34 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //344 B read + write with a DP_END write each, 99 here). Up to series v17 this was 9 + 1.2 per 8 bytes.
+     f64    contendDmaRead = 3.5, contendDmaReadUnit = 1.11, contendDmaReadGap = 0.55;     //per transfer, per 8 bytes, per doubling of the pause beyond 38 clocks
+     f64    contendDmaWrite = 2.4, contendDmaWriteUnit = 1.07, contendDmaWriteGap = 0.3;
+-    f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
 +    u64    frameDelay;             //HARNESS: contention clocks this list
 +    f64    spanPenalty = 40.0;     //measured extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (scattered primitives: 35-50, triangle strips: 13-26)
      f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
@@ -1667,12 +1810,31 @@ index 465dec4a..46938fe9 100644
 -    f64    atomicCost = 20.0;      //clocks per primitive with ATOMIC_PRIM set (rdp_timing v24/v25)
 -    f64    aaSpanCost = 3.5;
 +    u64    frameCommandBytes = 0; //HARNESS
++    f64    frameClipCycles = 0;   //HARNESS
++    u64    frameWrBytes = 0, frameRdBytes = 0, frameZRdBytes = 0, frameZWrBytes = 0;  //HARNESS: RDRAM traffic of the spans this list (colour write / colour read / depth read / depth write)
      f64    writeOnlySpan = 1.2;      //extra clocks per write-only span (no image read, no depth), 320-pixel-wide colour image (rdp_timing v31/v32)
      f64    writeOnlySpanWide = 2.8;  //the same for a colour image wider than 320 pixels (the MGC 2011 demo's 640x480)
-     f64    writeOnlyTri = 5.0;       //extra clocks per write-only triangle: edges (+5), shade words (+7), texture words (+30)
-     f64    writeOnlyShade = 7.0;
-     f64    writeOnlyTexture = 30.0;
-+    f64    blendOnlySpan = 0.0, blendOnlySpanWide = 0.0, blendOnlyTri = 0.0;  //HARNESS T_BLSP / T_BLSPW / T_BLTRI (0 = series v12)
+-    f64    writeOnlyTri = 0.0;       //extra clocks per write-only triangle: edges, shade words, texture words (+6: rdp_timing v44/v47/v48;
+-    f64    writeOnlyShade = 0.0;     //the +5 / +7 / +30 of v32's one-row triangles are the triangle's least time in timingTriangle)
+-    f64    writeOnlyTexture = 6.0;
+     f64    fillSpan = 1.0;           //extra clocks per fill span, 320-pixel-wide colour image (rdp_timing v44/v50)
+     f64    fillSpanWide = 2.7;       //the same for a wider colour image
+     f64    fillPixel = 0.014;        //and per pixel of a fill span
+-    f64    blendOnlySpan = 10.0;     //a blend-only span (IMAGE_READ, no depth) is this much cheaper than the tables + spanPenalty, 320-pixel-wide colour image (rdp_timing v50)
++    f64    blendOnlyTri = 0.0;       //HARNESS T_BLTRI
++    f64    writeOnlyTri = 0.0;       //extra clocks per write-only triangle: edges, shade words, texture words (+6: rdp_timing v44/v47/v48;
++    f64    writeOnlyShade = 0.0;     //the +5 / +7 / +30 of v32's one-row triangles are the triangle's least time in timingTriangle)
++    f64    writeOnlyTexture = 6.0;
++    f64    blendOnlySpan = 10.0;     //a blend-only span (IMAGE_READ, no depth) is this much cheaper than the tables + spanPenalty, 320-pixel-wide colour image (rdp_timing v33/v40)
+     f64    blendOnlySpanWide = 7.0;  //the same for a wider colour image (rdp_timing v49)
+-    f64    depthSpan = 10.0;         //a depth span is this much cheaper than the tables + spanPenalty (rdp_timing v49/v50)
+-    f64    depthSpanWide = 5.0;      //the same for a colour image wider than 320 pixels (rdp_timing v50)
+-    f64    rowAbove = 9.16;          //clocks per triangle row above the scissor (rdp_timing v50: 9.0 on DPC_CLOCK)
++    f64    depthSpan = 10.0;         //a depth span is this much cheaper than the tables + spanPenalty (rdp_timing v49)
++    f64    clipRowAbove = 0.0, clipRowBelow = 0.0;  //HARNESS: experiment
++    f64    rowAbove = 9.16;          //clocks per triangle row above the scissor (rdp_timing v50)
++    f64    depthSpanWide = 5.0;      //depthSpan for a colour image wider than 320 pixels (rdp_timing v50)
+     f64    clipRow = 11.0;           //clocks for a triangle row with no pixel inside the scissor (rdp_timing v48; v36: 88 for an 8-row triangle off screen)
      f64    sameBankNarrow = 1.10;    //depth-tested span with the depth buffer in the colour buffer's megabyte of RDRAM, up to 8 px (rdp_timing v35)
      f64    sameBank1 = 1.20;         //the same, wider spans, 1-cycle
      f64    sameBank2 = 1.165;        //the same, wider spans, 2-cycle
@@ -1681,6 +1843,9 @@ index 465dec4a..46938fe9 100644
 -    n1     atomicPrim;             //Set_Other_Modes bits the model needs beyond the cycle type and depth/image read
 -    n1     antialias;
      u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
+     f64    zPassLoss = 1.0;        //share of depth-tested pixels taken to pass for what a CPU transfer costs: 1 / overdraw of the last frame
+     f64    frameWork;              //clocks of work queued since the last Sync_Full, as priced (before calibration and the VI's factor)
+@@ -241,6 +238,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
  
      //state decoded from the command stream (only what the model needs)
      n2     cycleType;
@@ -1688,7 +1853,7 @@ index 465dec4a..46938fe9 100644
      n1     imageRead;
      n1     zCompare;
      n1     zUpdate;
-@@ -165,19 +160,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
+@@ -272,21 +270,13 @@ struct RDP : Thread, Memory::RCP<RDP> {
      u64    framePixels;
      u64    frameCycles;
      u64    syncFullCount;         //total Sync_Full commands seen (statistics)
@@ -1702,9 +1867,11 @@ index 465dec4a..46938fe9 100644
 -    //the task ends 0.05-0.3 VI before the RDP does (task_timing v20). So each DPC_END write records the
 -    //range and the work it queued, and DPC_CURRENT is read as the point of the oldest unfinished range
 -    //that the completed work has reached.
--    struct Range { u32 start, end; u64 before, after; };
+-    struct Range { u32 start, end; u64 before, after; bool fresh; };
 -    Range  ranges[2048];
 -    u32    rangeHead, rangeCount;
+-    bool   rangeFresh;             //the next range begins at a new DPC_START
+-    bool   depthSeen, depthLast;   //a primitive of this frame / of the previous one used the depth buffer (for the SP DMA's placement)
 +    u64    frameSpans, framePrims, frameLoadBytes, frameRects, frameFillPixels, framePipe, frameMem; //HARNESS stats
 +    u64    cycSpans[4] = {}, cycPixels[4] = {}, cycPipeBound[4] = {}, cycCost[4] = {}, cycPipeOnly[4] = {}, cycMemOnly[4] = {};  //HARNESS: per cycle type, cumulative
 +    u64    lastDelay; u64 frameDelayCalls, frameDelaySkipped, busyUnits, elapsedUnits; f64 frameModeCycles[65]; u64 frameModePixels[32]; u64 frameModeSpans[32]; u64 frameZCover; u8 zMask[480*80]; u64    lastPixels, lastCycles, lastSpans, lastPrims, lastLoadBytes, lastRects, lastFillPixels, lastPipe, lastMem;
@@ -1716,7 +1883,7 @@ index 465dec4a..46938fe9 100644
  
    struct Command {
 diff --git a/ares/n64/rdp/render.cpp b/ares/n64/rdp/render.cpp
-index 8c2c7754..19c35268 100644
+index f47e48cf..1f040278 100644
 --- a/ares/n64/rdp/render.cpp
 +++ b/ares/n64/rdp/render.cpp
 @@ -53,10 +53,14 @@ auto RDP::render() -> void {
@@ -1751,31 +1918,42 @@ index 8c2c7754..19c35268 100644
        }
      }
 diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
-index 34c57415..939c67e4 100644
+index 9337428b..470180ae 100644
 --- a/ares/n64/rdp/serialization.cpp
 +++ b/ares/n64/rdp/serialization.cpp
-@@ -38,8 +38,6 @@ auto RDP::serialize(serializer& s) -> void {
-   s(timing.accumulated);
-   s(timing.zPassFraction);
+@@ -48,8 +48,6 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.cpuLossData);
+   s(timing.cpuLossInstruction);
    s(timing.frameZPixels);
 -  s(timing.atomicPrim);
 -  s(timing.antialias);
    s(timing.submitted);
    s(timing.completed);
    s(timing.pending);
-@@ -47,7 +45,6 @@ auto RDP::serialize(serializer& s) -> void {
+@@ -59,7 +57,6 @@ auto RDP::serialize(serializer& s) -> void {
    s(timing.syncTargets);
    s(timing.framePixels);
    s(timing.frameCycles);
--  if(s.reading()) timing.rangeHead = timing.rangeCount = 0;  //the fetch-pointer ranges are not saved: DPC_CURRENT reads as DPC_END until the next DPC_END write
+-  if(s.reading()) timing.rangeHead = timing.rangeCount = 0, timing.rangeFresh = 0;  //the fetch-pointer ranges are not saved: DPC_CURRENT reads as DPC_END until the next DPC_END write
  
    s(edge.lmajor);
    s(edge.level);
 diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
-index 227fc6b1..94de0985 100644
+index 684ae07d..76357fe5 100644
 --- a/ares/n64/rdp/timing.cpp
 +++ b/ares/n64/rdp/timing.cpp
-@@ -53,14 +53,14 @@ auto RDP::timingReset() -> void {
+@@ -47,35 +47,38 @@
+ //while the RDP is frozen); the DP interrupt for a Sync_Full is raised, and the busy
+ //flags in DPC_STATUS cleared, once all work queued before it has completed.
+ 
++//HARNESS ARES_FEAT_LOG=1: where each list's time goes (FEAT line at every Sync_Full): spans by depth mode (0 none, 1 compare,
++//2 update, 3 both, 4 copy, 5 fill), image read and width (up to 2, 4, 8, 16, 32, 64, more), triangles, rectangles, texture loads;
++//FMODE lines: the same per Set_Other_Modes word
++static struct Feat { bool on = getenv("ARES_FEAT_LOG") != nullptr; f64 total = 0, tri = 0, rectTotal = 0, load = 0; f64 span[2][6][2][7] = {}; u32 n[2][6][2][7] = {}; f64 zfail = 0; u64 om = 0; struct M { u64 om = 0; f64 tri = 0; u32 tris = 0; f64 sp[2][7] = {}; u32 sn[2][7] = {}; }; M modes[128]; u32 nmodes = 0; auto mode() -> M& { for(u32 i = 0; i < nmodes; i++) if(modes[i].om == om) return modes[i]; if(nmodes < 127) nmodes++; modes[nmodes - 1] = M(); modes[nmodes - 1].om = om; return modes[nmodes - 1]; } } feat;
++
+ auto RDP::timingReset() -> void {
+   auto t = timing;  //preserve tunables
+   timing = {};
    timing.enable = t.enable;
    timing.contentionZ = t.contentionZ;
    timing.contentionPlain = t.contentionPlain;
@@ -1783,79 +1961,148 @@ index 227fc6b1..94de0985 100644
    timing.spanPenalty = t.spanPenalty;
    timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
    timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
--  timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
--  timing.contendDma = t.contendDma; timing.contendDmaBase = t.contendDmaBase;
+-  timing.viWidthScale = t.viWidthScale;
 +  timing.viWidthScale = t.viWidthScale; timing.viWidthScaleAA2 = t.viWidthScaleAA2; timing.viNtscScale = t.viNtscScale; timing.viContendScale = t.viContendScale;
++  for(u32 n : range(3)) { timing.cpuList[n] = t.cpuList[n]; timing.cpuColor[n] = t.cpuColor[n]; timing.cpuDepth[n] = t.cpuDepth[n]; timing.cpuVi[n] = t.cpuVi[n]; timing.cpuViAA2[n] = t.cpuViAA2[n]; }
++  timing.cpuPlace = t.cpuPlace; timing.rspBeside = t.rspBeside; timing.rspBesideVi = t.rspBesideVi; timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViUnit = t.dmaViUnit; timing.dmaViGap = t.dmaViGap; timing.dmaViGapWrite = t.dmaViGapWrite;
++  timing.dmaViAA2 = t.dmaViAA2; timing.dmaViUnitAA2 = t.dmaViUnitAA2; timing.dmaViGapAA2 = t.dmaViGapAA2; timing.dmaPlace = t.dmaPlace; timing.dmaViWrite = t.dmaViWrite;
+   timing.viContendDma = t.viContendDma; timing.viContendDmaAA2 = t.viContendDmaAA2; timing.viContendCpu = t.viContendCpu; timing.viContendCpuAA2 = t.viContendCpuAA2;
+-  timing.rspBeside = t.rspBeside; timing.rspBesideVi = t.rspBesideVi; timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViWrite = t.dmaViWrite; timing.dmaViUnit = t.dmaViUnit;
+-  timing.dmaViGap = t.dmaViGap; timing.dmaViGapWrite = t.dmaViGapWrite; timing.dmaViAA2 = t.dmaViAA2; timing.dmaViUnitAA2 = t.dmaViUnitAA2; timing.dmaViGapAA2 = t.dmaViGapAA2;
+-  for(u32 n : range(3)) {
+-    timing.cpuList[n] = t.cpuList[n]; timing.cpuColor[n] = t.cpuColor[n]; timing.cpuDepth[n] = t.cpuDepth[n];
+-    timing.cpuVi[n] = t.cpuVi[n]; timing.cpuViAA2[n] = t.cpuViAA2[n];
+-  }
+-  timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
+-  timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
++  timing.viContendCpuI = t.viContendCpuI; timing.viContendCpuIAA2 = t.viContendCpuIAA2; timing.viContendKinds = t.viContendKinds;
 +  timing.contendDma = t.contendDma;
    timing.zPassFraction = t.zPassFraction;
 -  timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
--  timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
 +  timing.zPassAuto = t.zPassAuto;
+   timing.zPassLoss = timing.zPassAuto ? 1.0 : timing.zPassFraction;
+   for(u32 n : range(2)) { timing.cpuLoad[n] = t.cpuLoad[n]; timing.cpuRest[n] = t.cpuRest[n]; }
+-  timing.cpuLossData = timing.contendCpu; timing.cpuLossInstruction = timing.contendCpuI;
+-  timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
++  timing.cpuLossData = timing.contendCpu; timing.cpuLossInstruction = timing.contendCpuI; timing.cpuAct = t.cpuAct;
    timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
-   timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
+-  timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
+-  timing.blendOnlySpan = t.blendOnlySpan; timing.blendOnlySpanWide = t.blendOnlySpanWide; timing.depthSpan = t.depthSpan; timing.depthSpanWide = t.depthSpanWide; timing.clipRow = t.clipRow; timing.rowAbove = t.rowAbove;
+   timing.fillSpan = t.fillSpan; timing.fillSpanWide = t.fillSpanWide; timing.fillPixel = t.fillPixel;
++  timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
++  timing.blendOnlySpan = t.blendOnlySpan; timing.blendOnlySpanWide = t.blendOnlySpanWide; timing.depthSpan = t.depthSpan; timing.clipRow = t.clipRow; timing.clipRowAbove = t.clipRowAbove; timing.clipRowBelow = t.clipRowBelow; timing.rowAbove = t.rowAbove; timing.depthSpanWide = t.depthSpanWide;
++  timing.blendOnlyTri = t.blendOnlyTri;
    timing.sameBankNarrow = t.sameBankNarrow; timing.sameBank1 = t.sameBank1; timing.sameBank2 = t.sameBank2;
-@@ -75,6 +75,7 @@ auto RDP::timingReset() -> void {
- //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
- auto RDP::timingAdd(f64 cycles) -> void {
-   if(!timing.enable || cycles <= 0.0) return;
-+  if(viWhole) cycles *= viModeFactor();  //HARNESS: T_VIWHOLE=1: the VI factor on the whole list (v15 measured it that way)
-   timing.frameCycles += (u64)cycles;
-   timing.accumulated += cycles * 3.0;
-   u64 work = (u64)timing.accumulated;
-@@ -86,7 +87,10 @@ auto RDP::timingAdd(f64 cycles) -> void {
- //another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
+   timing.loadStride = t.loadStride; timing.loadStrideWide = t.loadStrideWide;
+   timing.colorSize = 2;
+@@ -89,12 +92,13 @@ auto RDP::timingReset() -> void {
+ //32000 / 44100 Hz beside four game lists costs the RDP 2.7 clocks per sample, 5.9 when its buffer is in the megabyte
+ //of the colour buffer and 5.4 in that of the command list)
+ auto RDP::timingAudio(u32 address) -> void {
++  if(!audioModel) return;  //HARNESS T_AI=0
+   u32 megabyte = (address & 0xffffff) >> 20;
+   f64 clocks = timing.audioSample;
+   if(megabyte == (timing.colorAddress & 0xffffff) >> 20) clocks = timing.audioSampleColor;
+   else if(!command.source && megabyte == (u32)command.current >> 20) {
+     clocks = timing.audioSampleList;
+-    if(!rsp.status.halted) clocks = timing.audioSampleListTask * contendScale(ContendDma);  //a task feeding the list
++    if(!rsp.status.halted && timing.audioSampleListTask > 0.0) clocks = timing.audioSampleListTask * contendScale(ContendDma);  //a task feeding the list (HARNESS T_AITASK=0: off)
+   }
+   timingDelay(clocks);
+ }
+@@ -103,10 +107,12 @@ auto RDP::timingAudio(u32 address) -> void {
+ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+   if(!timing.enable || cycles + measured <= 0.0) return;
+   timing.frameWork += cycles;
++  if(feat.on) feat.total += cycles + measured;  //HARNESS
++  if(viWhole && !(viWholeAA2 && vi.io.antialias == 2)) cycles *= viModeFactor();  //HARNESS: T_VIWHOLE=1: the VI factor on the whole list in every mode
+   //in AA mode 2 (resample only, the MGC demo's) the VI slows the whole list, not only its spans and loads: the console's
+   //lists take 1.026 to 1.035 times as long with the VI on whatever they consist of (rdp_timing v29 / v42 / v53; the
+   //factor on spans and loads alone gave 1.023 to 1.026, least for the lists of small triangles)
+-  if(vi.io.antialias == 2) { f64 part = cycles * (viPictureFactor() - 1.0); timing.viPart += part; cycles += part; }
++  if(viWholeAA2 && vi.io.antialias == 2) { f64 part = cycles * (viPictureFactor() - 1.0); timing.viPart += part; cycles += part; }  //HARNESS T_VIWAA2=0
+   f64 viPart = min(timing.viPart, cycles) * timing.calibration;  //what the VI adds to this command while it reads the picture
+   timing.viPart = 0.0;
+   timing.pendingVi += viPart * 3.0;
+@@ -122,6 +128,7 @@ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+ //what a CPU transfer costs the RDP: 'clocks' in a megabyte the RDP does not use with the VI off, more where the
+ //RDP or the VI works (rdp_timing v59). 'address' is the RDRAM address of the transfer, ~0 when it is not known.
+ auto RDP::timingCpu(u32 kind, f64 clocks, u32 address) -> f64 {
++  if(!timing.cpuPlace) return clocks * contendScale(kind == CpuInstructionFill ? ContendCpuI : ContendCpu);  //HARNESS: series v22
+   f64 extra = 0.0, place = 0.0;
+   if(kind < CpuUncachedWrite && address < 0x0080'0000) {
+     u32 megabyte = address >> 20;
+@@ -131,8 +138,10 @@ auto RDP::timingCpu(u32 kind, f64 clocks, u32 address) -> f64 {
+     if(vi.picture() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) extra = (vi.io.antialias < 2 ? timing.cpuVi[kind] : timing.cpuViAA2[kind]) * timing.viPicture;
+   }
+   //what the RDP did in the last finished frame decides what a transfer in an unused megabyte costs it (timingLoss)
++  if(timing.cpuAct) {  //HARNESS T_CPUACT=0: off
+   if(kind == CpuInstructionFill) clocks = timing.cpuLossInstruction;
+   else clocks = clocks * timing.cpuLossData / timing.contendCpu;
++  }
+   return (clocks + place) * contendScale(ContendCpu) + extra;
+ }
+ 
+@@ -148,7 +157,11 @@ auto RDP::timingLoss(f64 cost, f64 data, f64 instruction) -> void {
  //everything queued, including the Sync_Full interrupts already waiting, completes that much later
+ //(real clocks: the losses in rdp.hpp are stated as measured, without the calibration of the list prices)
  auto RDP::timingDelay(f64 cycles) -> void {
 -  if(!timing.enable || cycles <= 0.0 || timing.pending == 0 || command.freeze) return;
 +  if(!timing.enable || cycles <= 0.0 || command.freeze) return;
 +  timing.frameDelayCalls++;
 +  if(timing.pending == 0) { timing.frameDelaySkipped += (u64)cycles; return; }
 +  timing.frameDelay += (u64)cycles;
++  if(clockScaleDelay) cycles *= timing.calibration;  //HARNESS T_CLKSCALED=1: the losses to other bus masters scaled too (series v16: real clocks, not scaled)
    timing.accumulated += cycles * 3.0;
    u64 work = (u64)timing.accumulated;
    timing.accumulated -= work;
-@@ -135,29 +139,45 @@ auto RDP::timingMode() -> u32 {
-   return timing.mode = mode;
- }
+@@ -204,8 +217,10 @@ auto RDP::viModeFactor() -> f64 {
  
--//how much the VI's framebuffer fetch slows the RDP in the current VI mode (see rdp.hpp)
-+//what a span or load costs in a running game relative to the idle-console tables
-+//the VI's framebuffer fetch slows every RDRAM transfer; measured with the game lists (rdp_timing v12):
-+//AA mode 3 (replicate, one line per output line) +2%, mode 2 (resample) +3%, modes 0/1 (anti-aliased:
-+//three lines per output line) +15-16%, and a 640-pixel-wide 16-bit image +47% (the game modes are
-+//measured on a PAL console; the knob 'viNtscScale' covers the NTSC line rate)
- auto RDP::viModeFactor() -> f64 {
+ //a span or a load in AA modes 0 / 1 / 3: priced as if the VI read the picture all the time; the part it adds is kept
+ //apart (timing.pendingVi) and not spent while the VI is outside the picture (timingStep)
+-auto RDP::timingVi(f64 cost) -> f64 {
+-  if(vi.io.antialias == 2) return cost;  //AA mode 2: on the whole list (timingAdd)
++auto RDP::timingVi(f64 cost, bool memoryBound) -> f64 {
++  if(viRmwOnly && !memoryBound) return cost;  //HARNESS T_VIRMW=1: only the spans that read the colour or depth buffer back
++  if(timing.viFactor > 1.0 && memoryBound && vi.active()) return cost * timing.viFactor;  //HARNESS old: fixed factor
++  if(viWhole || (viWholeAA2 && vi.io.antialias == 2)) return cost;  //AA mode 2: on the whole list (timingAdd)
+   f64 part = cost * (viPictureFactor() - 1.0);
+   timing.viPart += part;
+   return cost + part;
+@@ -228,25 +243,37 @@ auto RDP::viPictureFactor() -> f64 {
    if(!vi.active()) return 1.0;
    f64 f = vi.io.antialias == 3 ? timing.viFactorAA3 : vi.io.antialias == 2 ? timing.viFactorAA2 : timing.viFactorAA0;
    u32 bytes = ((u32)vi.io.width ? (u32)vi.io.width : 320u) * (vi.io.colorDepth == 3 ? 4u : 2u);
 -  if(bytes > 640 && vi.io.antialias < 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScale * ((f64)bytes / 640.0 - 1.0));
--  return f;
+-  return 1.0 + (f - 1.0) * timing.viPicture;
 +  if(bytes > 640 && vi.io.antialias < 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScale * ((f64)bytes / 640.0 - 1.0));  //only the divot/dedither modes grow with the line (v15: aa2 at 2560 B/line is still x1.03)
 +  else if(bytes > 640 && vi.io.antialias == 2) f = 1.0 + (f - 1.0) * (1.0 + timing.viWidthScaleAA2 * ((f64)bytes / 640.0 - 1.0));  //HARNESS T_VIAA2WS (rdp_timing v40: aa2 at 2560 B/line is x1.06)
-+  return 1.0 + (f - 1.0) * timing.viNtscScale;
++  return 1.0 + (f - 1.0) * timing.viNtscScale * timing.viPicture;
  }
  
 -//what a span or load costs in a running game relative to the idle-console tables
  auto RDP::timingScale(bool memoryBound) -> f64 {
-   f64 f = memoryBound ? timing.contentionZ : timing.contentionPlain;
--  return f * viModeFactor();
-+  //the VI's framebuffer fetch slows only the spans that read the colour or depth buffer back: write-only spans,
-+  //fills and TMEM loads take the same time in every VI mode on the console (rdp_timing v40)
-+  if(viRmwOnly && !memoryBound) return f;  //HARNESS T_VIRMW=0 restores the old behaviour
-+  if(timing.viFactor > 1.0 && memoryBound && vi.active()) f *= timing.viFactor;  //old: fixed factor
-+  else if(!viWhole) f *= viModeFactor();
-+  return f;
+   return memoryBound ? timing.contentionZ : timing.contentionPlain;  //the VI's part: timingVi
  }
  
--//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (v12: x1.25 in the AA modes)
+-//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (rdp_timing v56)
 +//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (v12: +25% in the AA modes)
- auto RDP::contendScale() -> f64 {
-   return 1.0 + (viModeFactor() - 1.0) * timing.viContendScale;
+ auto RDP::contendScale(u32 kind) -> f64 {
+-  bool aa2 = vi.io.antialias >= 2;  //no divot / dedither fetch
+-  f64 scale = kind == ContendDma ? (aa2 ? timing.viContendDmaAA2 : timing.viContendDma) : (aa2 ? timing.viContendCpuAA2 : timing.viContendCpu);
++  f64 scale = timing.viContendScale;
++  if(timing.viContendKinds) {
++    bool aa2 = vi.io.antialias >= 2;  //no divot / dedither fetch
++    scale = kind == ContendDma  ? (aa2 ? timing.viContendDmaAA2  : timing.viContendDma)
++          : kind == ContendCpuI ? (aa2 ? timing.viContendCpuIAA2 : timing.viContendCpuI)
++          :                       (aa2 ? timing.viContendCpuAA2  : timing.viContendCpu);
++  }
+   return 1.0 + (viModeFactor() - 1.0) * scale;
  }
  
 +static bool zCoverage = getenv("T_ZCOVER") != nullptr;  //HARNESS
  //cost of one span of 'pixels' pixels whose first pixel is at (x, y) of the color image
- auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
    if(pixels == 0) return 0.0;
 +  if(timing.debugFrame && y >= 0 && y < 240) {
 +    u32 c = timing.cycleType >= 2 ? (timing.cycleType == 3 ? timing.fillColor : 0x606060) : timing.debugColor;
@@ -1866,7 +2113,7 @@ index 227fc6b1..94de0985 100644
    u32 bytes = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
    u32 stride = (timing.colorWidth + 1) * bytes;
    u32 address = timing.colorAddress + y * stride + x * bytes;
-@@ -185,14 +205,14 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+@@ -275,6 +302,11 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
      f64 pass = rdp_tm_span(zpass, address, w);
      f64 fail = rdp_tm_span(zfail, address, w);
      timing.frameZPixels += pixels;
@@ -1876,33 +2123,203 @@ index 227fc6b1..94de0985 100644
 +      for(u32 px = x; px < xe; px++) { u8 bit = 1 << (px & 7); if(!(row[px >> 3] & bit)) { row[px >> 3] |= bit; timing.frameZCover++; } }
 +    }
      if(both) {
--      //a span whose pixels all fail the depth test is 15-40 clocks cheaper (no writes), but a span
--      //with even one passing pixel costs the full read-modify-write: the games' frames replayed with
--      //the depth buffer preset so that only their own overdraw fails cost exactly what the real frames
--      //cost (rdp_timing v24), so partial occlusion saves nothing. Only short spans are hidden as a
--      //whole (Donkey Kong 64's small triangles: -17% on the console, v28), so the estimated pass rate
--      //is applied to spans up to zFailWidth pixels and wider spans always pay the passing cost.
--      if(w <= (s32)timing.zFailWidth) cost += (fail - pass) * (1.0 - timing.zPassFraction);
-+      f64 f = (zNarrow && w > zNarrow) ? 1.0 : timing.zPassFraction;   //HARNESS T_ZNARROW: only spans up to N px can fail as a whole
-+      cost += (fail - pass) * (1.0 - f);
+       //a span whose pixels all fail the depth test is 15-40 clocks cheaper (no writes), but a span
+       //with even one passing pixel costs the full read-modify-write: the games' frames replayed with
+@@ -282,23 +314,19 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+       //cost (rdp_timing v24), so partial occlusion saves nothing. Only short spans are hidden as a
+       //whole (Donkey Kong 64's small triangles: -17% on the console, v28), so the estimated pass rate
+       //is applied to spans up to zFailWidth pixels and wider spans always pay the passing cost.
+-      //A failing span is 4 clocks cheaper than the tables' difference into a 320-pixel-wide colour image and 6 into
+-      //a wider one. A wider span is rarely hidden as a whole, but its failing pixels still save part of the writes:
+-      //a quarter of the difference at 16 pixels, half at 32 and three quarters from 64 on (rdp_timing v50: 512
+-      //overlapping triangles at one depth, 3-74% of their pixels failing).
+-      if(w <= (s32)timing.zFailWidth) cost += (fail - pass - (stride > 640 ? 6.0 : 4.0)) * (1.0 - timing.zPassFraction);
+-      else {
++      if(!(zNarrow && w > (s32)zNarrow)) cost += (fail - pass - (model15 ? (stride > 640 ? 6.0 : 4.0) : 0.0)) * (1.0 - timing.zPassFraction);  //HARNESS T_ZNARROW replaces zFailWidth
++      else if(zWide) {
++        //a wider span is rarely hidden as a whole, but its failing pixels do save part of the writes: a quarter of
++        //the difference at 16 pixels, half at 32 and three quarters from 64 on (rdp_timing v50: overlapping triangles)
+         f64 g = w >= 64 ? 0.75 : w >= 32 ? 0.5 + 0.25 * (w - 32) / 32.0 : 0.25 + 0.25 * (w - 16) / 16.0;
+-        cost += (fail - pass) * g * (1.0 - timing.zPassFraction);
++        cost += (fail - pass) * g * zWide * (1.0 - timing.zPassFraction);
+       }
+-    } else if(timing.zCompare && timing.imageRead) {
++    } else if(zcbModel && timing.zCompare && timing.imageRead) {  //HARNESS T_ZCBMODEL=0: the old path
+       //depth compare without update on a blended span (the MGC 2011 demo's particles, decals): on the console
+-      //it costs the blend-only span plus the depth read, +23 clocks up to 4 pixels, +28 at 8, +35 at 16, +49
+-      //at 32 and +80 at 64 when the test passes and +8 / +5 / +7 / +8 / +13 / +14 when it fails, the same in the
+-      //demo's, Donkey Kong 64's and Beetle Adventure Racing's modes, with the depth buffer in another megabyte
+-      //than the colour buffer as in all three games (rdp_timing v50; v49 had measured the same megabyte).
+-      //Adding "compare-only minus pass" to the blend-only table, as for the unblended case below, came out
+-      //cheaper than no depth test.
++      //it costs the blend-only span plus the depth read, +28 clocks up to 4 pixels, +33 at 8, +43 at 16 and
++      //+63 at 32 when the test passes and +11 / +10 / +13 / +15 / +25 when it fails, the same in the demo's,
++      //Donkey Kong 64's and Beetle Adventure Racing's modes (rdp_timing v49). Adding "compare-only minus
++      //pass" to the blend-only table, as for the unblended case below, came out cheaper than no depth test.
+       auto lerp = [&](f64 a2, f64 a4, f64 a8, f64 a16, f64 a32, f64 a64) -> f64 {
+         if(w <= 2) return a2;
+         if(w <= 4) return a2 + (a4 - a2) * (w - 2) / 2.0;
+@@ -307,8 +335,9 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+         if(w <= 32) return a16 + (a32 - a16) * (w - 16) / 16.0;
+         return a32 + (a64 - a32) * (w - 32) / 32.0;  //and on at the 32-64 slope
+       };
+-      f64 f = w <= (s32)timing.zFailWidth ? timing.zPassFraction : 1.0;
+-      cost += lerp(23.0, 23.2, 28.0, 35.1, 49.2, 79.8) * f + lerp(7.6, 5.4, 6.7, 7.8, 12.6, 13.7) * (1.0 - f);
++      f64 f = !(zNarrow && w > (s32)zNarrow) ? timing.zPassFraction : 1.0;  //HARNESS T_ZNARROW
++      if(model15) cost += lerp(23.0, 23.2, 28.0, 35.1, 49.2, 79.8) * f + lerp(7.6, 5.4, 6.7, 7.8, 12.6, 13.7) * (1.0 - f);
++      else cost += lerp(27.6, 28.3, 33.4, 43.2, 63.5, 103.9) * f + lerp(11.3, 10.1, 12.6, 15.3, 25.2, 45.0) * (1.0 - f);
+       compareBlend = true;
      } else {
        auto partial = timing.zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD;
-       f64 ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
-@@ -222,7 +242,9 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
-     cost += stride > 640 ? timing.writeOnlySpanWide : timing.writeOnlySpan;
+@@ -316,31 +345,30 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+       f64 scaled = rdp_tm_span(partial, address, w) * (ref > 0.0 ? pass / ref : 1.0);
+       cost += scaled - pass;
+       //a compare-only span whose pixels all fail costs what a failing compare + update span costs (rdp_timing v50)
+-      if(timing.zCompare && w <= (s32)timing.zFailWidth) cost += (fail - scaled - (stride > 640 ? 6.0 : 3.0)) * (1.0 - timing.zPassFraction);
++      if(model15 && timing.zCompare && !(zNarrow && w > (s32)zNarrow)) cost += (fail - scaled - (stride > 640 ? 6.0 : 3.0)) * (1.0 - timing.zPassFraction);
+     }
    }
  
--  timing.framePixels += pixels;
+   //other bus masters (CPU, RSP, VI) lengthen every span: measured as a factor on the span
+   f64 pipe = pixels * timing.pipeCycles;
+   if(cost < pipe) cost = pipe;
+-  cost = timingVi(cost * timingScale(timing.memoryBound));
++  cost = timingVi(cost * timingScale(timing.memoryBound), timing.memoryBound);
+   if(timing.memoryBound) {
+     cost += timing.spanPenalty;
+     //with the pixels outside the scissor charged (timingTriangle), the per-span prices can follow the
+-    //synthetic frames instead of making up for them: a blend-only span (IMAGE_READ, no depth) is 10 clocks
+-    //cheaper than the tables + 15 into a 320-pixel-wide colour image and 7 into a wider one, a depth span 10
+-    //and 5 (rdp_timing v49/v50: spans of 2-64 pixels in three games' modes, depth buffer in another megabyte)
++    //synthetic frames instead of making up for them: a blend-only span (IMAGE_READ, no depth) is 12 clocks
++    //cheaper than the tables + 15 into a 320-pixel-wide colour image and 7 into a wider one (rdp_timing
++    //v33/v40/v49), a depth span 10 (v49: 7-16 passing, 12-20 failing, up to 16 pixels, in three games' modes)
+     if(!(timing.zCompare || timing.zUpdate) || compareBlend) cost -= stride > 640 ? timing.blendOnlySpanWide : timing.blendOnlySpan;
+-    else cost -= stride > 640 ? timing.depthSpanWide : timing.depthSpan;
++    else cost -= model15 && stride > 640 ? timing.depthSpanWide : timing.depthSpan;
+     if(timing.zCompare || timing.zUpdate) {
+       //the depth buffer in the same megabyte of RDRAM as the colour buffer: every depth-tested span costs
+       //10% more up to 8 pixels and 16.5% (2-cycle) / 20% (1-cycle) more beyond, whatever the distance inside
+-      //the megabyte (rdp_timing v24/v35); 4 MiB games commonly place both in the same megabyte. Into a colour
+-      //image wider than 320 pixels it is 5% up to 8 pixels and 11.5% up to 16, and a compare-only blended span
+-      //pays 10% (320 wide; 11.5% beyond 16 pixels) or 5% (wider; 9% beyond 16) (rdp_timing v50).
++      //the megabyte (rdp_timing v24/v35); 4 MiB games commonly place both in the same megabyte
+       u32 depthRow = timing.depthAddress + y * (timing.colorWidth + 1) * 2;
+       if((depthRow >> 20) == (address >> 20)) {
+-        if(compareBlend) cost *= stride > 640 ? (w <= 16 ? 1.05 : 1.09) : (w <= 16 ? timing.sameBankNarrow : 1.115);
++        if(!model15) cost *= w <= 8 ? timing.sameBankNarrow : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
++        else if(compareBlend) cost *= stride > 640 ? (w <= 16 ? 1.05 : 1.09) : (w <= 16 ? timing.sameBankNarrow : 1.115);
+         else if(stride > 640) cost *= w <= 8 ? 1.05 : w <= 16 ? 1.115 : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
+         else cost *= w <= 8 ? timing.sameBankNarrow : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
+       }
+@@ -352,12 +380,46 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+     //one (rdp_timing v31/v32: the MGC 2011 demo's 640x480 parts)
+     cost += stride > 640 ? timing.writeOnlySpanWide : timing.writeOnlySpan;
+   }
++  if(timing.cycleType < 2 && timing.zCompare && !timing.zUpdate && timing.imageRead) cost += zcmpBlendSpan;  //HARNESS T_ZCB: depth compare without update + IMAGE_READ (the MGC demo's part 5 particles: +28 clocks per span on the console, rdp_timing v46 p5_5075 chunks 0-2)
+   else if(timing.cycleType == 3) {
+-    //fill spans cost more than the tables on the console: +1.0 clocks per span into a 320-pixel-wide colour
+-    //image, +2.7 into a wider one, and +0.014 per pixel (rdp_timing v44: widths 16-638; v50: fill triangles)
++    //fill spans cost more than the tables on the console: +1.0 clocks per span into a 320-pixel-wide
++    //colour image, +2.7 into a wider one, and +0.014 per pixel (rdp_timing v44: widths 16-638)
+     cost += (stride > 640 ? timing.fillSpanWide : timing.fillSpan) + timing.fillPixel * w;
+   }
+ 
 +  timing.framePixels += pixels; timing.frameModePixels[timing.mode & 31] += pixels; timing.frameModeSpans[timing.mode & 31]++; timing.frameSpans++; timing.framePipe += (u64)pipe; timing.frameMem += (u64)(cost - pipe);
 +  { u32 ct = timing.cycleType & 3; timing.cycSpans[ct]++; timing.cycPixels[ct] += pixels; if(pipe >= cost / timingScale(timing.memoryBound) - (timing.memoryBound ? timing.spanPenalty : 0) - 0.5) timing.cycPipeBound[ct]++; timing.cycCost[ct] += (u64)cost; timing.cycPipeOnly[ct] += (u64)pipe; timing.cycMemOnly[ct] += (u64)rdp_tm_span(mode, address, w); }
 +  if(timing.cycleType >= 2) timing.frameFillPixels += pixels;
++  { //HARNESS: RDRAM bytes of this span (bandwidth study): colour bpp from Set_Color_Image; depth 16-bit; with a depth test only the passing pixels are written
++    u32 bpp = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
++    f64 pass = timing.zCompare ? timing.zPassFraction : 1.0;
++    if(timing.cycleType < 2) {
++      timing.frameWrBytes += (u64)(pixels * bpp * pass);
++      if(timing.imageRead) timing.frameRdBytes += (u64)pixels * bpp;
++      if(timing.zCompare) timing.frameZRdBytes += (u64)pixels * 2;
++      if(timing.zUpdate) timing.frameZWrBytes += (u64)(pixels * 2 * pass);
++    } else if(timing.cycleType == 2) { timing.frameWrBytes += (u64)pixels * bpp; timing.frameRdBytes += (u64)pixels * bpp; }  //copy: TMEM -> colour, the texels were loaded
++    else timing.frameWrBytes += (u64)pixels * bpp;  //fill
++  }
++  if(viClass && vi.active()) {
++    //HARNESS T_VICLASS (rdp_timing v45): the VI's slowdown by span class, colour image width and whether the VI reads
++    //from the megabyte the RDP draws into; factors relative to the uniform per-mode factor already applied
++    bool same = (vi.io.dramAddress >> 20) == (timing.colorAddress >> 20);
++    bool wide = stride > 640, z = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate);
++    bool blend = timing.cycleType < 2 && !z && timing.imageRead, fill = timing.cycleType == 3;
++    f64 k = 1.0;
++    if(vi.io.antialias < 2) {         //aa0 / aa1 (the games' 320x240 modes)
++      if(z) k = same ? 1.025 : 1.004;
++      else if(blend) k = same ? 1.018 : 0.995;
++      else if(!wide) k = fill ? (same ? 1.072 : 1.033) : (same ? 1.121 : 1.076);
++    } else if(vi.io.antialias == 2 && same) {  //resample only (the MGC demo's mode): only the same-megabyte case differs
++      if(z) k = 1.021;
++      else if(blend) k = wide ? 1.020 : 1.045;
++      else k = wide ? (fill ? 1.007 : 1.015) : (fill ? 1.058 : 1.069);
++    }
++    if(viClass == 2) k = same ? k : 1.0;  //2: the same-megabyte part only
++    cost *= k;
++  }
+   { //what a CPU cache line fill costs the RDP while it draws this span (data fill, instruction fill), by span width up
+     //to 2, 4, 8, 16, 32, 64 pixels and beyond. Measured beside lists of one kind of span each, VI off, the fills back to
+     //back in a megabyte the list does not use, read from DPC_PIPEBUSY, which stops with the RDP (rdp_timing v72 / v73;
+@@ -399,8 +461,13 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+     }
+     timingLoss(cost, data, instruction);
+   }
+-
+-  timing.framePixels += pixels;
++  if(feat.on) {  //HARNESS
++    u32 zc = timing.cycleType >= 2 ? 4 + (timing.cycleType == 3) : (timing.zCompare ? 1 : 0) | (timing.zUpdate ? 2 : 0);
++    u32 wb = pixels <= 2 ? 0 : pixels <= 4 ? 1 : pixels <= 8 ? 2 : pixels <= 16 ? 3 : pixels <= 32 ? 4 : pixels <= 64 ? 5 : 6;
++    feat.span[rectangle][zc][timing.imageRead & 1][wb] += cost; feat.n[rectangle][zc][timing.imageRead & 1][wb]++;
++    if(zc == 1 || zc == 3) feat.zfail += cost * (1.0 - timing.zPassFraction);
++    { auto& m = feat.mode(); m.sp[rectangle][wb] += cost; m.sn[rectangle][wb]++; }
++  }
    return cost;
  }
  
-@@ -248,7 +270,41 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
-   if(rowEnd - rowStart > 1024) rowEnd = rowStart + 1024;  //guard against garbage
+@@ -410,6 +477,7 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+ //list costs the command fetch in the same way. Where the RSP's output buffer is makes no other difference.
+ auto RDP::timingPlacement(s32 row) -> f64 {
+   if(command.source) return 0.0;  //XBUS: the commands come from DMEM
++  if(!placeModel) return 0.0;  //HARNESS T_PLACE=0
+   u32 pixel = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
+   u32 width = timing.colorWidth + 1;
+   u32 y = row < 0 ? 0 : row;
+@@ -420,6 +488,7 @@ auto RDP::timingPlacement(s32 row) -> f64 {
+   if(list == (timing.colorAddress + y * width * pixel & 0xffffff) >> 20) clocks += timing.listColor;
+   if(depth && list == (timing.depthAddress + y * width * 2 & 0xffffff) >> 20) clocks += timing.listDepth;
+   if(vi.active() && list == (vi.io.dramAddress & 0xffffff) >> 20) clocks += vi.io.antialias < 2 ? timing.listViAA : timing.listVi;
++  placeClocks += clocks;  //HARNESS
+   return clocks;
+ }
  
-   f64 cycles = 0.0;
+@@ -441,24 +510,58 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+   s32 rowStart = (s32)floor(fyh);
+   s32 rowEnd   = (s32)ceil(fyl);
+   //rows cut off by the scissor in Y: the RDP steps a triangle down from its top one row at a time and stops at
+-  //the scissor's bottom, so the rows above the scissor cost 9 clocks each and the rows below nothing (rdp_timing
+-  //v50; the MGC 2011 demo's background triangles start 10-20 rows above the screen: 1-3% of a list, v46)
++  //the scissor's bottom, so the rows above the scissor cost 9 clocks each and the rows below nothing (rdp_timing v50)
+   s32 rowsAbove = (rowEnd < (s32)timing.scissorY0 ? rowEnd : (s32)timing.scissorY0) - rowStart;
+-  if(rowsAbove < 0) rowsAbove = 0;
+-  if(rowsAbove > 1024) rowsAbove = 1024;  //guard against garbage
++  s32 rowsBelow = rowEnd - (rowStart > (s32)timing.scissorY1 ? rowStart : (s32)timing.scissorY1);
++  if(rowsAbove < 0) rowsAbove = 0; if(rowsBelow < 0) rowsBelow = 0;
++  if(rowsAbove > 1024) rowsAbove = 1024; if(rowsBelow > 1024) rowsBelow = 1024;
+   if(rowStart < timing.scissorY0) rowStart = timing.scissorY0;
+   if(rowEnd   > timing.scissorY1) rowEnd   = timing.scissorY1;
+   if(rowEnd - rowStart > 1024) rowEnd = rowStart + 1024;  //guard against garbage
+   bool rowsInside = rowEnd > rowStart;
+ 
+-  f64 cycles = 0.0;
+-  if(rowsAbove && rowsInside) {
++  f64 cycles = timing.clipRowAbove * rowsAbove + timing.clipRowBelow * rowsBelow;
++  if(model15 && rowsAbove && rowsInside) {
+     //the first span's start-up overlaps the walk: 7 clocks (write-only, fill), 36 (IMAGE_READ), 45 (depth)
+     f64 overlap = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate) ? 45.0 : timing.cycleType < 2 && timing.imageRead ? 36.0 : 7.0;
+     f64 walk = timing.rowAbove * rowsAbove - overlap;
+     if(walk > 0.0) cycles += walk;
+   }
 -  u32 widest = 0, spans = 0;
 +  u32 widest = 0, spans = 0, spanPixels = 0; f64 spanWideTotal = 0.0;
 +  timing.framePrims++;
@@ -1942,25 +2359,63 @@ index 227fc6b1..94de0985 100644
    for(s32 row = rowStart; row < rowEnd; row++) {
      f64 yc = row + 0.5;
      if(yc < fyh || yc >= fyl) continue;
-@@ -260,7 +316,7 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+@@ -469,10 +572,9 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     //the RDP walks each row as four sub-scanlines and the span it writes runs from the leftmost to the
      //rightmost edge position among them, so a slanted edge widens the span: on the console a triangle whose
      //edges move 8 px per row costs like one 6 px wider (rdp_timing v36), and the games' lists come out
-     //1-3% dearer than the centre-line width says (v37/v38)
+-    //1-3% dearer than the centre-line width says (v37/v38). Write-only spans narrower than 16 pixels do not
+-    //widen: apex triangles 1-32 pixels wide cost no more than rectangles of their mean width (v32)
++    //1-3% dearer than the centre-line width says (v37/v38)
+     f64 x0c = x0, x1c = x1;
 -    for(s32 k = 0; k < 4; k++) {
 +    if(widenModel) for(s32 k = 0; k < 4; k++) {  //HARNESS T_WIDEN=0: centre-line width only (series v10); 2: whole pixels
        f64 ys = row + 0.125 + 0.25 * k;
        if(ys < fyh || ys >= fyl) continue;
        f64 a = fxh + fdxhdy * (ys - fyh);
-@@ -269,23 +325,29 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+@@ -481,7 +583,8 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
        if(a < x0) x0 = a;
        if(b > x1) x1 = b;
      }
+-    if(x1c - x0c < 16.0 && !timing.memoryBound) { x0 = x0c; x1 = x1c; }
 +    if(widenModel == 2) { x0 = floor(x0); x1 = floor(x1) + 1.0; }  //whole pixels, inclusive of the last
-     if(x0 < timing.scissorX0) x0 = timing.scissorX0;
-     if(x1 > timing.scissorX1) x1 = timing.scissorX1;
++    if(x1c - x0c < widenMin && (widenAll || !timing.memoryBound)) { x0 = x0c; x1 = x1c; }  //HARNESS T_WIDENMIN: no widening of narrow (write-only) spans
+     //the scissor does not make the cut-off part of a span free (rdp_timing v46-v48). The RDP walks a span from
+     //the major edge (XH): the pixels in front of the scissor on that side go by at the pipeline rate (1 clock
+     //per pixel in 1-cycle mode, 2 in 2-cycle, about 0.5 in fill / copy), what sticks out beyond the far scissor
+@@ -489,7 +592,8 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     //and side. A span that reads memory overlaps part of its start-up with the walk (15 clocks x rate with
+     //IMAGE_READ, 6 x rate more with depth). The large background triangles of the MGC 2011 demo extend
+     //hundreds of pixels beyond the screen: 4-10% of a list.
+-    if(x1 < timing.scissorX0 || x0 >= timing.scissorX1) {
++    if(!clipModel) {}  //HARNESS T_CLIPMODEL=0: nothing charged outside the scissor (series v13)
++    else if(x1 < timing.scissorX0 || x0 >= timing.scissorX1) {
+       cycles += timing.clipRow;
+     } else {
+       bool majorLeft = ops[0] >> 55 & 1;
+@@ -508,18 +612,44 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
      if(x1 <= x0) continue;
      u32 pixels = (u32)(x1 - x0 + 0.5);
      if(pixels == 0) pixels = 1;
++    if(cvgModel && pixels <= 48) {
++      //HARNESS T_CVG: coverage. The RDP samples each pixel at two points on each of the four sub-scanlines (a
++      //checkerboard of 8); a sliver that misses all of a row's sample points draws nothing in that row
++      s32 ycur = yh & ~3; bool covered = false; u32 coveredPixels = 0; u64 mask = 0; s32 base = (s32)floor(x0) - 8;
++      for(s32 k = row * 4; k < row * 4 + 4; k++) {
++        if(k < yh || k >= yl) continue;
++        s64 a = (s64)xh + ((s64)(dxhdy >> 2) * (k - ycur));
++        s64 b = k < ym ? (s64)xm + ((s64)(dxmdy >> 2) * (k - ycur)) : (s64)xl + ((s64)(dxldy >> 2) * (k - ym));
++        if(a > b) { s64 t = a; a = b; b = t; }
++        for(s32 q = 0; q < 2; q++) {
++          s64 f = (k & 1 ? 0x4000 : 0) + q * 0x8000;  //sample offsets 0 / 0.5 on even sub-scanlines, 0.25 / 0.75 on odd ones
++          s64 p0 = (a - f + 0xffff) >> 16, p1 = (b - f) >> 16;  //pixels whose sample lies in [a, b]
++          for(s64 pp = p0; pp <= p1; pp++) { s64 i = pp - base; if(i >= 0 && i < 64) mask |= 1ull << i; else if(i >= 64) covered = true; }
++        }
++      }
++      for(u32 i : range(64)) if(mask >> i & 1) coveredPixels++;
++      if(coveredPixels) covered = true;
++      if(!covered) { cycles += cvg0Row; cvg0Rows++; continue; }
++      if(cvgModel >= 2 && coveredPixels < pixels) pixels = coveredPixels;
++    }
      if(pixels > widest) widest = pixels;
 -    spans++;
 +    spans++; spanPixels += pixels;
@@ -1984,21 +2439,47 @@ index 227fc6b1..94de0985 100644
 -  if(timing.atomicPrim) cycles += timing.atomicCost;
 -  if(timing.antialias && timing.cycleType == 0) cycles += timing.aaSpanCost * (f64)spans;
 +  }
++  if(timing.memoryBound && !(timing.zCompare || timing.zUpdate) && timing.cycleType < 2) cycles += timing.blendOnlyTri;  //HARNESS T_BLTRI: a blend-only triangle's fixed cost (v33 mgc_blend640_h1: console 73 / tables 49 at one span)
    if(!timing.memoryBound && timing.cycleType < 2) {
-     //a write-only triangle (no image read, no depth) pays for its command words on the console: a
-     //one-span triangle costs 26 clocks with edges only, 35 with shade and 65 with shade and texture,
-@@ -294,6 +356,10 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     //a write-only triangle (no image read, no depth): the texture words add 6 clocks to an 8-row triangle
+     //(rdp_timing v44/v47/v48: 33.4 against 32.7 clocks per span with and without texture)
+@@ -527,7 +657,7 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
      if(shade) cycles += timing.writeOnlyShade;
      if(texture) cycles += timing.writeOnlyTexture;
+   }
+-  if(timing.cycleType < 2 && spans) {
++  if(triFloor && timing.cycleType < 2 && spans) {  //HARNESS T_TRIFLOOR=0: no least time
+     //a triangle cannot finish before its command words are taken in and each of its rows has had its 11
+     //clocks: 15 clocks for the edge words, +9 with shade, +31 with texture, +10 when the spans read the
+     //colour image. One-row write-only triangles cost 26 / 35 / 65 clocks on the console, two rows 77, four
+@@ -536,14 +666,24 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     f64 least = 15.0 + (shade ? 9.0 : 0.0) + (texture ? 31.0 : 0.0) + (timing.imageRead ? 10.0 : 0.0) + 11.0 * (f64)spans;
+     if(cycles < least) cycles = least;
+   }
+-  if(spans == 0) {
++  if(model15 && spans == 0) {
+     //a triangle without a visible span still has its command words taken in: 23.5 clocks for the edge words alone,
+     //66 with shade and texture, 76 with depth, whatever the number of rows below the scissor; one wholly above the
+-    //scissor is walked down to its last row: 16 clocks + 9 per row (+43 with ATOMIC_PRIM) (rdp_timing v50)
++    //scissor is walked down to its last row: 15.7 clocks + 9 per row (+43 with ATOMIC_PRIM) (rdp_timing v50)
+     f64 least = shade || texture || zbuffer ? 16.3 + (shade ? 9.0 : 0.0) + (texture ? 31.0 : 0.0) + (zbuffer ? 10.0 : 0.0) + 11.0 : 23.5;
+     if(rowsAbove && !rowsInside) cycles = 16.0 + timing.rowAbove * rowsAbove + (timing.atomicPrim ? 43.0 : 0.0);
+     if(cycles < least) cycles = least;
    }
 +  //a primitive that reads the color/depth buffers somewhere other than where the previous
 +  //one left off (every primitive of a real scene) pays for the row changes and the
 +  //read-after-write hazards against the previous primitive's writes
 +  timing.frameModeCycles[timing.mode & 31] += cycles;  //HARNESS
-   timingAdd(cycles);
++  { //HARNESS: triangle histogram by class (0 write-only, 1 reads memory, 2 depth, 3 fill/copy) and visible rows
++    u32 c = timing.cycleType >= 2 ? 3 : (timing.zCompare || timing.zUpdate) ? 2 : timing.memoryBound ? 1 : 0;
++    u32 b = spans == 0 ? 0 : spans == 1 ? 1 : spans == 2 ? 2 : spans <= 4 ? 3 : spans <= 8 ? 4 : spans <= 16 ? 5 : spans <= 32 ? 6 : 7;
++    triHistN[c][b]++; triHistC[c][b] += cycles; triHistS[c][b] += spans; triHistP[c][b] += spanPixels; triHistA[c][b] += rowsAbove;
++  }
++  if(feat.on) { feat.tri += cycles; auto& m = feat.mode(); m.tri += cycles; m.tris++; }  //HARNESS
+   timingAdd(cycles, timingPlacement(rowStart));
  }
  
-@@ -307,10 +373,16 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
+@@ -557,16 +697,24 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
    if(py1 > timing.scissorY1) py1 = timing.scissorY1;
    f64 cycles = 0.0;
    u32 width = px1 > px0 ? px1 - px0 : 0;
@@ -2007,25 +2488,49 @@ index 227fc6b1..94de0985 100644
 +  static bool paintAll = getenv("ARES_SIL_ALL") != nullptr;
 +  if(!fill && width >= 200 && !paintAll) timing.debugFrame = nullptr;  //don't paint full-screen overlays
    if(width && py1 > py0) {
-     for(s32 row = py0; row < py1; row++) cycles += timingSpan(px0, row, width);
+     for(s32 row = py0; row < py1; row++) cycles += timingSpan(px0, row, width, true);
    }
 +  timing.debugFrame = saved;
    cycles += rdp_tm_prim_overhead((enum rdp_tm_mode)timing.mode, width ? width : 1);
 +  timing.frameModeCycles[32 + (timing.mode & 31)] += cycles;  //HARNESS
-   timingAdd(cycles);
++  if(feat.on) feat.rectTotal += cycles;  //HARNESS
+   timingAdd(cycles, timingPlacement(py0));
  }
  
-@@ -343,6 +415,9 @@ auto RDP::timingStep(u32 clocks) -> u32 {
+ auto RDP::timingSyncFull() -> void {
+   if(!timing.enable) return;
+   timing.syncFullCount++;
++  { static bool imgLog2 = getenv("ARES_IMG_LOG") != nullptr; if(imgLog2) fprintf(stderr, "IMGSF sf=%llu vi=%06x\n", (unsigned long long)timing.syncFullCount, (u32)vi.io.dramAddress); }  //HARNESS
+   timingAdd(RDP_TM_LIST_BASE);  //list start + Sync_Full
+   if(timing.syncQueued == 8) {
+     //should never happen (games wait for the DP interrupt); complete the oldest one
+@@ -617,6 +765,25 @@ auto RDP::timingStep(u32 clocks) -> u32 {
  
  //a Sync_Full has finished executing: signal the CPU
  auto RDP::timingComplete() -> void {
 +  static bool syncLog = getenv("ARES_SYNC_LOG") != nullptr;  //HARNESS
++  if(feat.on) {
++    fprintf(stderr, "FEAT %llu total=%.0f tri=%.0f rect=%.0f load=%.0f zfail=%.0f zpass=%.3f", (unsigned long long)timing.syncFullCount, feat.total, feat.tri, feat.rectTotal, feat.load, feat.zfail, timing.zPassFraction);
++    for(u32 r : range(2)) for(u32 z : range(6)) for(u32 i : range(2)) for(u32 w : range(7)) if(feat.n[r][z][i][w]) fprintf(stderr, " %u%u%u%u=%.0f:%u", r, z, i, w, feat.span[r][z][i][w], feat.n[r][z][i][w]);
++    fprintf(stderr, "\n");
++    for(u32 mi = 0; mi < feat.nmodes; mi++) { auto& m = feat.modes[mi];
++      fprintf(stderr, "FMODE %llu om=%016llx tri=%.0f n=%u", (unsigned long long)timing.syncFullCount, (unsigned long long)m.om, m.tri, m.tris);
++      for(u32 r : range(2)) for(u32 w : range(7)) if(m.sn[r][w]) fprintf(stderr, " %u%u=%.0f:%u", r, w, m.sp[r][w], m.sn[r][w]);
++      fprintf(stderr, "\n");
++    }
++    bool on = feat.on; u64 om = feat.om; feat = Feat(); feat.on = on; feat.om = om;
++  }
 +  if(syncLog) fprintf(stderr, "SYNC %llu t=%lld sub=%llu done=%llu pend=%llu cyc=%llu delay=%llu delayCalls=%llu delaySkipped=%llu busy=%llu elapsed=%llu rdpclk=%lld px=%llu spans=%llu prims=%llu rects=%llu fill=%llu pipe=%llu mem=%llu load=%llu\n", (unsigned long long)timing.syncFullCount, (long long)(cpu.clockEpoch + cpu.Thread::clock), (unsigned long long)timing.submitted, (unsigned long long)timing.completed, (unsigned long long)timing.pending, (unsigned long long)timing.frameCycles, (unsigned long long)timing.frameDelay, (unsigned long long)timing.frameDelayCalls, (unsigned long long)timing.frameDelaySkipped, (unsigned long long)timing.busyUnits, (unsigned long long)timing.elapsedUnits, (long long)Thread::clock, (unsigned long long)timing.framePixels, (unsigned long long)timing.frameSpans, (unsigned long long)timing.framePrims, (unsigned long long)timing.frameRects, (unsigned long long)timing.frameFillPixels, (unsigned long long)timing.framePipe, (unsigned long long)timing.frameMem, (unsigned long long)timing.frameLoadBytes);
++  if(syncLog) { fprintf(stderr, "DMAGAP rd"); for(u32 b : range(6)) fprintf(stderr, " %u", rsp.dmaGapHist[0][b]); fprintf(stderr, " wr"); for(u32 b : range(6)) fprintf(stderr, " %u", rsp.dmaGapHist[1][b]); fprintf(stderr, "\n"); }
++  memset(rsp.dmaGapHist, 0, sizeof rsp.dmaGapHist);
++  if(syncLog) { fprintf(stderr, "TRIH"); for(u32 c : range(4)) for(u32 b : range(8)) if(triHistN[c][b]) fprintf(stderr, " %u:%u=%u/%.0f/%u/%u/%u", c, b, triHistN[c][b], triHistC[c][b], triHistS[c][b], triHistP[c][b], triHistA[c][b]); fprintf(stderr, "\n"); }
++  memset(triHistN, 0, sizeof triHistN); memset(triHistC, 0, sizeof triHistC); memset(triHistS, 0, sizeof triHistS); memset(triHistP, 0, sizeof triHistP); memset(triHistA, 0, sizeof triHistA);
++  if(syncLog) fprintf(stderr, "BYTES wr=%llu rd=%llu zrd=%llu zwr=%llu load=%llu cmd=%llu spdma=%llu icache=%llu dcache=%llu wback=%llu ucrd=%llu ucwr=%llu vi=%u/%u/%u/%u/%u/%u\n", (unsigned long long)timing.frameWrBytes, (unsigned long long)timing.frameRdBytes, (unsigned long long)timing.frameZRdBytes, (unsigned long long)timing.frameZWrBytes, (unsigned long long)timing.frameLoadBytes, (unsigned long long)timing.frameCommandBytes, (unsigned long long)rsp.dmaBytes, (unsigned long long)cpu.profile.icacheMisses, (unsigned long long)cpu.profile.dcacheMisses, (unsigned long long)cpu.profile.dcacheWritebacks, (unsigned long long)cpu.uncachedReads, (unsigned long long)cpu.uncachedWrites, (u32)vi.io.colorDepth, (u32)vi.io.serrate, (u32)vi.io.antialias, (u32)vi.io.width, (u32)vi.io.xscale, (u32)vi.io.yscale);  //HARNESS: this list's RDP bytes; the sp dma / cpu counters are cumulative
 +  if(syncLog) { fprintf(stderr, "MODEPX"); for(u32 m : range(32)) if(timing.frameModePixels[m] > 0) fprintf(stderr, " %u:%llu", m, (unsigned long long)timing.frameModePixels[m]); fprintf(stderr, "\n"); fprintf(stderr, "MODESP"); for(u32 m : range(32)) if(timing.frameModeSpans[m] > 0) fprintf(stderr, " %u:%llu", m, (unsigned long long)timing.frameModeSpans[m]); fprintf(stderr, "\n"); fprintf(stderr, "MODES"); for(u32 m : range(65)) if(timing.frameModeCycles[m] > 0) fprintf(stderr, " %u:%.0f", m, timing.frameModeCycles[m]); fprintf(stderr, "\n"); }
    if(!command.crashed) {
      mi.raise(MI::IRQ::DP);
      if(timing.pending == 0) {
-@@ -351,11 +426,16 @@ auto RDP::timingComplete() -> void {
+@@ -625,11 +792,16 @@ auto RDP::timingComplete() -> void {
        command.startGclk = 0;
      }
    }
@@ -2042,19 +2547,19 @@ index 227fc6b1..94de0985 100644
      if(area > 0 && timing.frameZPixels > 0) {
        f64 n = timing.frameZPixels / area;
        if(n < 1.0) n = 1.0;
-@@ -366,9 +446,10 @@ auto RDP::timingComplete() -> void {
-       timing.zPassFraction = f;
+@@ -641,9 +813,10 @@ auto RDP::timingComplete() -> void {
+       timing.zPassLoss = 1.0 / n;  //for what a CPU transfer costs: what is drawn over something else is taken to fail
      }
    }
 -  timing.frameZPixels = 0;
 +  timing.frameZPixels = 0; timing.frameZCover = 0; if(zCoverage) memset(timing.zMask, 0, sizeof(timing.zMask));
    timing.framePixels = 0;
    timing.frameCycles = 0;
-+  timing.frameSpans = timing.framePrims = timing.frameLoadBytes = timing.frameRects = timing.frameFillPixels = timing.framePipe = timing.frameMem = timing.frameDelay = timing.frameDelayCalls = timing.frameDelaySkipped = 0; for(auto& c : timing.frameModeCycles) c = 0; for(auto& c : timing.frameModePixels) c = 0; for(auto& c : timing.frameModeSpans) c = 0;
++  timing.frameWrBytes = timing.frameRdBytes = timing.frameZRdBytes = timing.frameZWrBytes = 0; timing.frameSpans = timing.framePrims = timing.frameLoadBytes = timing.frameRects = timing.frameFillPixels = timing.framePipe = timing.frameMem = timing.frameDelay = timing.frameDelayCalls = timing.frameDelaySkipped = 0; for(auto& c : timing.frameModeCycles) c = 0; for(auto& c : timing.frameModePixels) c = 0; for(auto& c : timing.frameModeSpans) c = 0;
  }
  
  //account for one complete RDP command (ops[0] holds the first 64-bit word)
-@@ -377,6 +458,117 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -652,6 +825,118 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    u64 op = ops[0];
    u32 code = op >> 56 & 0x3f;
    const f64 state = rdp_tm_state_cmd(command.source);
@@ -2062,7 +2567,8 @@ index 227fc6b1..94de0985 100644
 +  static bool opLog = getenv("ARES_OP_LOG") != nullptr;  //HARNESS: per-frame opcode histogram
 +  static u32 opCount[64]; static u64 opCycles[64];
 +  static bool imgLog = getenv("ARES_IMG_LOG") != nullptr;  //HARNESS: color/depth image addresses
-+  if(imgLog && (code == 0x3e || code == 0x3f)) fprintf(stderr, "IMG %02x %06x w=%u sz=%u\n", code, (u32)(op & 0x3ffffff), (u32)(op >> 32 & 0x3ff) + 1, (u32)(op >> 51 & 3));
++  static bool texLog = getenv("ARES_TEX_LOG") != nullptr;  //HARNESS: texture image addresses as well
++  if(imgLog && (code == 0x3e || code == 0x3f || (texLog && code == 0x3d))) fprintf(stderr, "IMG %02x %06x w=%u sz=%u cur=%06x src=%u sf=%llu t=%llu vi=%06x\n", code, (u32)(op & 0x3ffffff), (u32)(op >> 32 & 0x3ff) + 1, (u32)(op >> 51 & 3), (u32)command.current, (u32)command.source, (unsigned long long)timing.syncFullCount, (unsigned long long)rsp.rspTime, (u32)vi.io.dramAddress);
 +  //HARNESS: dump command lists (with the depth buffer they start from) for replay on hardware
 +  //ARES_DUMP_LISTS=first:last:dir dumps the lists whose Sync_Full index is in [first, last]
 +  static const char* dumpSpec = getenv("ARES_DUMP_LISTS");
@@ -2172,7 +2678,7 @@ index 227fc6b1..94de0985 100644
  
    //bytes per texel of the texture image, times two (so that 4bpp is 1)
    auto texelBytes2 = [&](u32 texels) -> u32 {
-@@ -397,6 +589,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -672,6 +957,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    case 0x25: { //Texture_Rectangle_Flip
      s32 x1 = n12(op >> 44), y1 = n12(op >> 32);
      s32 x0 = n12(op >> 12), y0 = n12(op >>  0);
@@ -2180,7 +2686,11 @@ index 227fc6b1..94de0985 100644
      timingRectangle(x0, y0, x1, y1, false);
    } break;
  
-@@ -420,8 +613,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -692,11 +978,11 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+ 
+   case 0x2f: { //Set_Other_Modes
+     timing.cycleType = n2(op >> 52);
++    feat.om = op;  //HARNESS
      timing.imageRead = n1(op >>  6);
      timing.zUpdate   = n1(op >>  5);
      timing.zCompare  = n1(op >>  4);
@@ -2190,29 +2700,35 @@ index 227fc6b1..94de0985 100644
      timingMode();
      timingAdd(state);
    } break;
-@@ -429,14 +621,14 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -704,18 +990,14 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
    case 0x30: { //Load_TLUT
      s32 s0 = n12(op >> 44) >> 2, s1 = n12(op >> 12) >> 2;
      u32 count = s1 >= s0 ? s1 - s0 + 1 : 0;
--    timingAdd(rdp_tm_load_tlut(count) * timingScale(false));
-+    { f64 c_ = rdp_tm_load_tlut(count) * timingScale(false); timing.frameModeCycles[64] += c_; timingAdd(c_); }
+-    f64 cost = timingLoad(rdp_tm_load_tlut(count));
+-    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+-    timingAdd(cost);
++    { f64 c_ = timingLoad(rdp_tm_load_tlut(count)); timing.frameModeCycles[64] += c_; if(feat.on) feat.load += c_; timingLoss(c_, timing.cpuLoad[0], timing.cpuLoad[1]); timingAdd(c_); }
    } break;
  
    case 0x33: { //Load_Block
      s32 s0 = n12(op >> 44), s1 = n12(op >> 12);
      u32 texels = s1 >= s0 ? s1 - s0 + 1 : 0;
      u32 bytes = texelBytes2(texels) >> 1;
--    timingAdd(rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false));
-+    { f64 c_ = rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false); timing.frameModeCycles[64] += c_; timingAdd(c_); }
+-    f64 cost = timingLoad(rdp_tm_load_block((bytes + 1) >> 1));
+-    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+-    timingAdd(cost);
++    { f64 c_ = timingLoad(rdp_tm_load_block((bytes + 1) >> 1)); timing.frameModeCycles[64] += c_; if(feat.on) feat.load += c_; timingLoss(c_, timing.cpuLoad[0], timing.cpuLoad[1]); timingAdd(c_); }
    } break;
  
    case 0x34: { //Load_Tile
-@@ -451,7 +643,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+@@ -730,9 +1012,7 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
      //rows of the source image further apart than 512 / 1024 bytes cost 1.2 / 2.3 clocks more each (rdp_timing v34: a 32x32
      //RGBA16 tile out of a 320-pixel-wide image +4.8%, out of a 640-pixel-wide one +8.5%)
      f64 strideCost = stride >= 1024 ? timing.loadStrideWide : stride >= 512 ? timing.loadStride : 0.0;
--    timingAdd((rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false));
-+    { f64 c_ = (rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false); timing.frameModeCycles[64] += c_; timingAdd(c_); }
+-    f64 cost = timingLoad(rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h);
+-    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
+-    timingAdd(cost);
++    { f64 c_ = timingLoad(rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h); timing.frameModeCycles[64] += c_; if(feat.on) feat.load += c_; timingLoss(c_, timing.cpuLoad[0], timing.cpuLoad[1]); timingAdd(c_); }
    } break;
  
    case 0x36: { //Fill_Rectangle
@@ -2273,41 +2789,98 @@ index c718ec2e..d9d9c7dc 100644
        value[1] = Memory::Writable::read<Word>(address | 0x04);
        value[2] = Memory::Writable::read<Word>(address | 0x08);
 diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
-index 94135115..d826a005 100644
+index e84acc2d..0a321c73 100644
 --- a/ares/n64/rsp/dma.cpp
 +++ b/ares/n64/rsp/dma.cpp
-@@ -1,5 +1,5 @@
+@@ -1,6 +1,7 @@
  auto RSP::dmaQueue(u32 clocks, Thread& thread) -> void {
--  if(rdp.timing.enable && vi.active()) clocks = (u32)(clocks * (vi.io.antialias < 2 ? DmaViFactor : DmaViFactorAA3));
-+  if(rdp.timing.enable && vi.active()) clocks = (u32)(clocks * (vi.io.antialias < 2 ? dmaViFactor : dmaViFactorAA3));  //HARNESS: v19
+-  if(rdp.timing.enable && vi.picture()) clocks = (u32)(clocks * (1.0 + ((vi.io.antialias < 2 ? DmaViFactor : DmaViFactorAA3) - 1.0) * rdp.timing.viPicture));  //only while the VI reads the picture
++  if(rdp.timing.enable && vi.picture()) clocks = (u32)(clocks * (1.0 + ((vi.io.antialias < 2 ? dmaViFactor : dmaViFactorAA3) - 1.0) * rdp.timing.viPicture));  //HARNESS: v19; only while the VI reads the picture
    dma.clock = (Thread::clock - thread.clock) - clocks;
++  harnessDmaClocks += clocks;  //HARNESS
  }
  
-@@ -18,8 +18,11 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+ auto RSP::dmaStep(u32 clocks) -> void {
+@@ -20,16 +21,33 @@ auto RSP::dmaStep(u32 clocks) -> void {
+ //each, 81 to 101 against 99). 'start' is the first row of a transfer.
+ auto RSP::dmaContention(bool start) -> f64 {
+   auto& t = rdp.timing;
++  if(start) {  //HARNESS ARES_DMA_LOG=1: every SP DMA (task_timing v22's replay tables)
++    static bool dmaLog = getenv("ARES_DMA_LOG");
++    if(dmaLog) fprintf(stderr, "DMALOG %06x %u %d %u %d %d\n", (u32)dma.current.dramAddress, (u32)dma.current.length, (int)!dma.busy.read, (u32)(dma.idle / 3), (int)rdp.command.freeze, (int)(u32)dma.current.pbusAddress);
++  }
++  if(start && t.pending) {  //HARNESS ARES_DMA_MIB=1: where the transfers beside a busy RDP are (megabyte classes)
++    static struct Hist { u64 n[2][16] = {}, mib[2][8] = {}; bool on = getenv("ARES_DMA_MIB");
++      ~Hist() { if(!on) return; for(u32 d : range(2)) { for(u32 c : range(16)) if(n[d][c]) fprintf(stderr, "DMAMIB %s list%d color%d depth%d vi%d %llu\n", d ? "write" : "read", c & 1, c >> 1 & 1, c >> 2 & 1, c >> 3 & 1, (unsigned long long)n[d][c]);
++        for(u32 m : range(8)) if(mib[d][m]) fprintf(stderr, "DMAMIBN %s mib%d %llu\n", d ? "write" : "read", m, (unsigned long long)mib[d][m]); } } } hist;
++    if(hist.on) {
++      u32 m = (u32)dma.current.dramAddress >> 20 & 7, c = 0;
++      if(!rdp.command.source && m == ((u32)rdp.command.current >> 20 & 7)) c |= 1;
++      if(m == (t.colorAddress >> 20 & 7)) c |= 2;
++      if(m == (t.depthAddress >> 20 & 7)) c |= 4;
++      if(vi.active() && m == ((u32)vi.io.dramAddress >> 20 & 7)) c |= 8;
++      hist.n[!dma.busy.read][c]++; hist.mib[!dma.busy.read][m]++;
++    }
++  }
+   u32 units = (dma.current.length + 8) / 8;
+   f64 clocks = dma.busy.read ? t.contendDmaRead + units * t.contendDmaReadUnit : t.contendDmaWrite + units * t.contendDmaWriteUnit;
+   u32 gap = dma.idle / 3;  //RDP clocks since the previous transfer ended
+   if(start && gap >= 38) clocks += (dma.busy.read ? t.contendDmaReadGap : t.contendDmaWriteGap) * log2((f64)(gap > 8192 ? 8192 : gap) / 38.0);
+   f64 extra = 0.0;
+-  if(start) {
+-    //where the transfer's RDRAM side is (rdp_timing v57, with the VI off and in the titles' VI modes): in the megabyte
+-    //of the colour buffer it costs 3.0 to 6.2 clocks more, in that of the depth buffer of a list that uses depth 3.5 to
+-    //5.1; in the megabyte the VI shows, in AA modes 0/1, 4.1 to 4.7 more for 168 B / 344 B back to back, 10.3 / 12.0
+-    //for 1024 B and 6.5 to 7.8 after a pause; in the MGC demo's AA mode 2 1.9 to 2.4, 4.3 / 4.8 and 1.5 to 3.5
++  if(start && t.dmaPlace) {  //HARNESS T_DMAPLACE=0 (series v20)
++    //where the transfer's RDRAM side is (rdp_timing v57): the megabyte of the colour buffer +4.7 (3.0 to 6.2), of the
++    //depth buffer of a list that uses depth +4.3 (3.5 to 5.1); and the megabyte the VI shows, in the title's VI mode,
++    //+4.1 to 4.7 for 168 B / 344 B back to back, +10.3 / 12.0 for 1024 B, +6.5 to 7.8 after a pause (AA 0/1);
++    //+1.9 to 2.4, +4.3 / 4.8, +1.5 to 3.5 in the MGC demo's AA mode 2
+     u32 megabyte = (u32)dma.current.dramAddress >> 20;
+     bool depth = t.depthSeen || t.depthLast;  //the frame being drawn, or the one before it, uses the depth buffer
+     if(megabyte == (t.colorAddress & 0xffffff) >> 20) clocks += t.dmaColor;
+@@ -39,7 +57,7 @@ auto RSP::dmaContention(bool start) -> f64 {
+       else extra = t.dmaViAA2 + units * t.dmaViUnitAA2 + (gap >= 38 && dma.busy.read ? t.dmaViGapAA2 : 0.0);
+     }
+   }
+-  return clocks * rdp.contendScale(RDP::ContendDma) + extra * t.viPicture;
++  return clocks * (dmaContendVi ? rdp.contendScale(RDP::ContendDma) : 1.0) + extra * t.viPicture;  //HARNESS T_DMAVIX;
+ }
+ 
+ auto RSP::dmaTransferStart(Thread& thread) -> void {
+@@ -48,8 +66,16 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
      dma.current = dma.pending;
      dma.busy    = dma.full;
      dma.full    = {0,0};
--    dmaQueue(dmaClocks(dma.current.length) + DmaClocksPerTransfer, thread);
--    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());  //the RDP loses the bus meanwhile
+-    dmaQueue(dmaClocks(dma.current.length) + (dma.busy.read ? DmaClocksPerTransfer : DmaClocksPerWrite), thread);
+-    rdp.timingDelay(dmaContention(true));  //the RDP loses the bus meanwhile
 +    dmaCount++; dmaBytes += (dma.current.length + 8) * (dma.current.count + 1);  //HARNESS
++    u64 dmaGap = dma.idle / 3;  //HARNESS: RDP clocks since the previous transfer ended
++    if(rdp.timing.pending) { u32 b = dmaGap < 32 ? 0 : dmaGap < 128 ? 1 : dmaGap < 512 ? 2 : dmaGap < 2048 ? 3 : dmaGap < 8192 ? 4 : 5; dmaGapHist[dma.busy.read ? 0 : 1][b]++; }
++    bool dmaCont = dmaContendBaseCont >= 0 && dmaGapClocks > 0 && dmaGap < dmaGapClocks;  //HARNESS T_DMAGAP / T_DMAXBC: back-to-back transfers
 +    static bool dmaLog = getenv("ARES_DMA_LOG") != nullptr;  //HARNESS
 +    if(dmaLog) fprintf(stderr, "DMA %s len %u count %u dram %06x pend %llu\n", dma.busy.read ? "rd" : "wr", (u32)dma.current.length + 8, (u32)dma.current.count + 1, (u32)dma.current.dramAddress, (unsigned long long)rdp.timing.pending);
-+    dmaQueue((u32)((dma.current.length+8) / 8 * dmaRate) + dmaLatency, thread);
-+    rdp.timingDelay((dmaContendBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * (dmaContendVi ? rdp.contendScale() : 1.0));
++    dmaQueue((u32)((dma.current.length+8) / 8 * dmaRate) + dmaLatency + (!dma.busy.read ? dmaWriteLatency : 0), thread);
++    if(dmaModel) rdp.timingDelay(dmaContention(true));  //HARNESS T_DMAMODEL=0: 9 + 1.2 per 8 bytes (series v7 to v16)
++    else
++    rdp.timingDelay(((dmaCont ? dmaContendBaseCont : !dma.busy.read && dmaContendBaseW >= 0 ? dmaContendBaseW : dmaContendBase) + (dma.current.length+8) / 8 * (!dma.busy.read && dmaContendW >= 0 ? dmaContendW : rdp.timing.contendDma)) * (dmaContendVi ? rdp.contendScale(RDP::ContendDma) : 1.0));  //HARNESS T_DMAXBW / T_DMAXW: writes to RDRAM
    }
  }
  
-@@ -66,8 +69,8 @@ auto RSP::dmaTransferStep() -> void {
+@@ -96,8 +122,10 @@ auto RSP::dmaTransferStep() -> void {
    if(dma.current.count) {
      dma.current.count -= 1;
      dma.current.dramAddress += dma.current.skip;
 -    dmaQueue(dmaClocks(dma.current.length), *this);
--    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());
+-    rdp.timingDelay(dmaContention(false));
 +    dmaQueue((u32)((dma.current.length+8) / 8 * dmaRate), *this);
-+    rdp.timingDelay((dmaContendBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * (dmaContendVi ? rdp.contendScale() : 1.0));
++    if(dmaModel) rdp.timingDelay(dmaContention(false));
++    else
++    rdp.timingDelay(((!dma.busy.read && dmaContendBaseW >= 0 ? dmaContendBaseW : dmaContendBase) + (dma.current.length+8) / 8 * (!dma.busy.read && dmaContendW >= 0 ? dmaContendW : rdp.timing.contendDma)) * (dmaContendVi ? rdp.contendScale(RDP::ContendDma) : 1.0));  //HARNESS T_DMAXBW / T_DMAXW: writes to RDRAM
    } else {
      dma.busy = {0,0};
-     dma.current.length = 0xFF8;
+     dma.idle = 0;
 diff --git a/ares/n64/rsp/interpreter-ipu.cpp b/ares/n64/rsp/interpreter-ipu.cpp
 index 9a3d93cb..a56b3689 100644
 --- a/ares/n64/rsp/interpreter-ipu.cpp
@@ -2321,7 +2894,7 @@ index 9a3d93cb..a56b3689 100644
    status.broken = 1;
    if(status.interruptOnBreak) mi.raise(MI::IRQ::SP);
 diff --git a/ares/n64/rsp/io.cpp b/ares/n64/rsp/io.cpp
-index 19bf5473..982dde32 100644
+index 19bf5473..ec72be0b 100644
 --- a/ares/n64/rsp/io.cpp
 +++ b/ares/n64/rsp/io.cpp
 @@ -119,6 +119,7 @@ auto RSP::ioWrite(u32 address, u32 data_, Thread& thread) -> void {
@@ -2332,7 +2905,7 @@ index 19bf5473..982dde32 100644
      if(data.bit( 0) && !data.bit( 1)) status.halted = 0;
      if(data.bit( 1) && !data.bit( 0)) status.halted = 1;
      if(data.bit( 2)) status.broken = 0;
-@@ -201,3 +202,46 @@ auto RSP::Status::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+@@ -201,3 +202,55 @@ auto RSP::Status::writeWord(u32 address, u32 data_, Thread& thread) -> void {
  
    self.debugger.ioStatus(Write, address, data);
  }
@@ -2346,12 +2919,18 @@ index 19bf5473..982dde32 100644
 +  harnessTaskCount++;
 +  if(type == 1) harnessGfxTaskCount++;
 +  harnessTaskClock = cpu.busNow();
++  { u64 r = 0, w = 0; for(u32 n : range(8)) { r += rdp.dpcRspReads[n]; w += rdp.dpcRspWrites[n]; }
++    harnessProf[0] = busyClocks; harnessProf[1] = dmaCount; harnessProf[2] = dmaBytes; harnessProf[3] = harnessDmaClocks; harnessProf[4] = r << 32 | (w & 0xffffffff); }
 +  if(logEnv) fprintf(stderr, "TASK start #%u type %u gfx#%u clock %lld vi %llu sync %llu dpc %06x-%06x cur %06x pending %llu\n", harnessTaskCount, type, harnessGfxTaskCount,
 +    (long long)harnessTaskClock, (unsigned long long)vi.harnessFrames, (unsigned long long)rdp.timing.syncFullCount, rdp.command.start, rdp.command.end, rdp.command.current, (unsigned long long)rdp.timing.pending);
 +  if(dumpEnv && type == 1) {
-+    u32 n = atoi(dumpEnv); const char* colon = strchr(dumpEnv, ':');
-+    if(colon && harnessGfxTaskCount == n) {
++    const char* colon = strchr(dumpEnv, ':');
++    bool match = false;  //N[,N...]:dir (several tasks go to dir/<N>/)
++    bool several = colon && memchr(dumpEnv, ',', colon - dumpEnv);
++    for(const char* q = dumpEnv; colon && q < colon; ) { if((u32)atoi(q) == harnessGfxTaskCount) match = true; q = (const char*)memchr(q, ',', colon - q); if(!q) break; q++; }
++    if(colon && match) {
 +      string dir = colon + 1;
++      if(several) { dir = {dir, "/", harnessGfxTaskCount}; directory::create(dir); }
 +      auto dump = [&](string name, auto&& reader, u32 size) {
 +        std::vector<u8> buf(size);
 +        for(u32 a = 0; a < size; a += 4) { u32 w = reader(a); buf[a] = w >> 24; buf[a+1] = w >> 16; buf[a+2] = w >> 8; buf[a+3] = w; }
@@ -2378,12 +2957,15 @@ index 19bf5473..982dde32 100644
 +  static const char* logEnv = getenv("ARES_TASK_LOG");
 +  if(logEnv) fprintf(stderr, "TASK end #%u clock %lld (+%lld) vi %llu sync %llu pending %llu\n", harnessTaskCount, (long long)cpu.busNow(), (long long)(cpu.busNow() - harnessTaskClock),
 +    (unsigned long long)vi.harnessFrames, (unsigned long long)rdp.timing.syncFullCount, (unsigned long long)rdp.timing.pending);
++  if(logEnv) { u64 r = 0, w = 0; for(u32 n : range(8)) { r += rdp.dpcRspReads[n]; w += rdp.dpcRspWrites[n]; }
++    fprintf(stderr, "TASKPROF #%u type %u busy %llu dma %llu bytes %llu dmaclk %llu dpcrd %llu dpcwr %llu\n", harnessTaskCount, (u32)dmem.read<Word>(0xfc0), (unsigned long long)(busyClocks - harnessProf[0]),
++      (unsigned long long)(dmaCount - harnessProf[1]), (unsigned long long)(dmaBytes - harnessProf[2]), (unsigned long long)(harnessDmaClocks - harnessProf[3]), (unsigned long long)(r - (harnessProf[4] >> 32)), (unsigned long long)(w - (harnessProf[4] & 0xffffffff))); fprintf(stderr, "TASKDPC #%u rd", harnessTaskCount); for(u32 n : range(8)) fprintf(stderr, " %llu", (unsigned long long)rdp.dpcRspReads[n]); fprintf(stderr, " wr"); for(u32 n : range(8)) fprintf(stderr, " %llu", (unsigned long long)rdp.dpcRspWrites[n]); fprintf(stderr, "\n"); }
 +}
 diff --git a/ares/n64/rsp/rsp.cpp b/ares/n64/rsp/rsp.cpp
-index b7436888..7647d3ef 100644
+index b7436888..a0ab53a8 100644
 --- a/ares/n64/rsp/rsp.cpp
 +++ b/ares/n64/rsp/rsp.cpp
-@@ -40,6 +40,8 @@ auto RSP::main() -> void {
+@@ -40,8 +40,11 @@ auto RSP::main() -> void {
        profile.haltedCycles += 128;
      } else {
        instruction();
@@ -2391,19 +2973,24 @@ index b7436888..7647d3ef 100644
 +      busyClocks += Thread::clock - clock;  //HARNESS
      }
  
++    rspTime += Thread::clock - clock;  //HARNESS: monotonic time for the DMA gap statistics
      dmaStep(Thread::clock - clock);
+   }
+ }
 diff --git a/ares/n64/rsp/rsp.hpp b/ares/n64/rsp/rsp.hpp
-index c7655458..4bcbae01 100644
+index 3a0e0c5f..8e251764 100644
 --- a/ares/n64/rsp/rsp.hpp
 +++ b/ares/n64/rsp/rsp.hpp
-@@ -261,17 +261,14 @@ struct RSP : Thread, Memory::RCP<RSP> {
+@@ -261,22 +261,18 @@ struct RSP : Thread, Memory::RCP<RSP> {
    } pipeline;
  
    //dma.cpp
 -  //an SP DMA takes 38 RSP cycles plus 0.15 per byte on hardware (rsp_timing v16/v19b: 8 B 38, 64 B 44,
 -  //256 B 70, 512 B 108, 1 KiB 186, 3.5 KiB 581; writes to RDRAM 32 + 0.145/B), in system clocks (3 per
 -  //RSP cycle): 114 + 3.6 per 8 bytes
--  enum : u32 { DmaClocksPerTransfer = 114 };
+-  //rdp_timing v52 (RDP idle, 64 B - 1 KiB): a write to RDRAM is over 7 CPU count ticks (28 system clocks) sooner
+-  //than a read of the same length
+-  enum : u32 { DmaClocksPerTransfer = 114, DmaClocksPerWrite = 86 };
 -  static constexpr auto dmaClocks(u32 length) -> u32 { return (length + 8) * 9 / 20; }  //3.6 per 8 bytes
 -  //the DMA shares RDRAM with the VI and the CPU (rsp_timing v19): in the games' 320x240 AA modes it takes
 -  //18% longer (4% in the ROM's replicate mode), and every CPU cache line transfer that overlaps it delays
@@ -2412,7 +2999,7 @@ index c7655458..4bcbae01 100644
 -  static constexpr f64 DmaViFactor = 1.12, DmaViFactorAA3 = 1.04;
 -  enum : u32 { DmaCpuPenaltyClocks = 54, DmaCpuStallCycles = 19 };  //54 system clocks = 18 RCP clocks
 +  u64 busyClocks = 0, dmaCount = 0, dmaBytes = 0; u32 rspSlowdown = 0; s64 rspAccum = 0;  //HARNESS: system clocks spent executing (not halted)
-+  f64 dmaRate = 3, dmaContendBase = 0; u32 dmaLatency = 0; bool dmaContendVi = false;  //HARNESS: system clocks per 8 bytes, per transfer; RDP clocks lost per transfer on top of contendDma per 8 B (v19b: 6)
++  f64 dmaRate = 3, dmaContendBase = 0, dmaContendBaseW = -1, dmaContendW = -1; u64 rspTime = 0, dmaEndTime = 0; u32 dmaGapHist[2][6] = {}; f64 dmaGapClocks = 0, dmaContendBaseCont = -1; u32 dmaModel = 1; s32 dmaWriteLatency = -28; u32 dmaLatency = 0; bool dmaContendVi = false;  //HARNESS: system clocks per 8 bytes, per transfer; RDP clocks lost per transfer on top of contendDma per 8 B (v19b: 6)
 +  //HARNESS: v19: the DMA is slowed by the VI (320x240 AA modes: +4..18% -> 1.12) and by each CPU line transfer it
 +  //overlaps (about 18 RCP clocks each); a CPU line transfer that overlaps a DMA waits about 19 cycles
 +  f64 dmaViFactor = 1.12, dmaViFactorAA3 = 1.04; u32 dmaCpuPenalty = 54, dmaCpuStall = 19;
@@ -2421,12 +3008,36 @@ index c7655458..4bcbae01 100644
 +  u32 harnessTaskCount = 0, harnessGfxTaskCount = 0; s64 harnessTaskClock = 0;  //HARNESS
    auto dmaQueue(u32 clocks, Thread& thread) -> void;
    auto dmaStep(u32 clocks) -> void;
+   auto dmaContention(bool start) -> f64;
++  u64 harnessDmaClocks = 0, harnessProf[5] = {};  //HARNESS: ARES_TASK_LOG profile of a task
    auto dmaTransferStart(Thread& thread) -> void;
+   auto dmaTransferStep() -> void;
+ 
+diff --git a/ares/n64/si/io.cpp b/ares/n64/si/io.cpp
+index 9fd94bb0..3e47ba4c 100644
+--- a/ares/n64/si/io.cpp
++++ b/ares/n64/si/io.cpp
+@@ -84,6 +84,7 @@ auto SI::ioWrite(u32 address, u32 data_) -> void {
+     io.dmaState = 1;
+     io.pchState = 4;
+     int cycles = pif.estimateTiming();
++    { static bool siLog = getenv("ARES_PI_LOG") != nullptr; if(siLog) fprintf(stderr, "SIDMA t=%lld read64 dur %d dram %06x\n", (long long)cpu.busNow(), cycles*3, (u32)io.dramAddress); }  //HARNESS
+     cpu.queueInsert(Queue::SI_DMA_Read, cycles*3);
+   }
+ 
+@@ -101,6 +102,7 @@ auto SI::ioWrite(u32 address, u32 data_) -> void {
+     io.dmaBusy = 1;
+     io.dmaState = 4;
+     io.pchState = 1;
++    { static bool siLog = getenv("ARES_PI_LOG") != nullptr; if(siLog) fprintf(stderr, "SIDMA t=%lld write64 dur %d dram %06x\n", (long long)cpu.busNow(), 4065*3, (u32)io.dramAddress); }  //HARNESS
+     cpu.queueInsert(Queue::SI_DMA_Write, 4065*3);
+   }
+ 
 diff --git a/ares/n64/vi/io.cpp b/ares/n64/vi/io.cpp
-index d541f286..cae5a21e 100644
+index d541f286..f066706a 100644
 --- a/ares/n64/vi/io.cpp
 +++ b/ares/n64/vi/io.cpp
-@@ -115,6 +115,7 @@ auto VI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+@@ -115,11 +115,13 @@ auto VI::writeWord(u32 address, u32 data_, Thread& thread) -> void {
      io.reserved.bit(7)     = data.bit( 7);
      io.antialias           = data.bit( 8, 9);
      io.reserved.bit(10,15) = data.bit(10,15);
@@ -2434,13 +3045,31 @@ index d541f286..cae5a21e 100644
    }
  
    if(address == 1) {
+     //VI_DRAM_ADDRESS
+     io.dramAddress = data.bit(0,23);
++    { static bool imgLog = getenv("ARES_IMG_LOG") != nullptr; if(imgLog) fprintf(stderr, "VIORG %06x t=%llu line=%u\n", (u32)io.dramAddress, (unsigned long long)rsp.rspTime, (u32)io.vcounter); }  //HARNESS
+   }
+ 
+   if(address == 2) {
 diff --git a/ares/n64/vi/vi.hpp b/ares/n64/vi/vi.hpp
-index 043e9f2c..fc21658c 100644
+index b49710ba..38afe238 100644
 --- a/ares/n64/vi/vi.hpp
 +++ b/ares/n64/vi/vi.hpp
-@@ -24,6 +24,8 @@ struct VI : Thread, Memory::RCP<VI> {
+@@ -22,16 +22,20 @@ struct VI : Thread, Memory::RCP<VI> {
+   auto main() -> void;
+   auto refresh() -> void;
    auto power(bool reset) -> void;
++  bool pictureAlways = false;  //HARNESS
    auto active() -> bool { return io.colorDepth != 0; }
+   //is the VI reading the frame buffer just now? Only on the lines of the picture (VI_V_VIDEO, in half-lines): during
+   //vertical blanking it leaves RDRAM alone. On the console the RDP and the RSP run at their VI-off speed for those 0.097 VI
+   //of every field (task_timing v26: the progress of a task replayed with the VI on, sampled every 1/50 VI)
+   auto picture() -> bool {
+     if(!active()) return false;
++    if(pictureAlways) return true;  //HARNESS T_VIPICM=0: series v25
+     u32 half = (u32)io.vcounter << 1 | (u32)io.field;
+     return half >= (u32)io.vstart && half < (u32)io.vend;
+   }
  
 +  u32 lastControl = 0;  //HARNESS
 +  u64 harnessFrames = 0;  //HARNESS: VI frames so far (set by the harness)
@@ -2478,10 +3107,10 @@ index 00000000..5fffce7e
 +set_target_properties(headless PROPERTIES PREFIX "")
 diff --git a/headless/main.cpp b/headless/main.cpp
 new file mode 100644
-index 00000000..467dd7d9
+index 00000000..26159b76
 --- /dev/null
 +++ b/headless/main.cpp
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,479 @@
 +#include <algorithm>
 +#include <unordered_map>
 +// Minimal headless harness for the ares N64 core (debugging aid, not part of ares proper).
@@ -2744,12 +3373,55 @@ index 00000000..467dd7d9
 +    if(auto v = getenv("T_WB_SYNC")) cpu.wbSync = atoi(v);
 +    if(auto v = getenv("T_EXC")) cpu.exceptionCost = atoi(v);
 +    if(auto v = getenv("T_VIAA0")) rdp.timing.viFactorAA0 = atof(v);
++    if(auto v = getenv("T_FILLSP")) rdp.timing.fillSpan = atof(v);
++    if(auto v = getenv("T_FILLSPW")) rdp.timing.fillSpanWide = atof(v);
++    if(auto v = getenv("T_FILLPX")) rdp.timing.fillPixel = atof(v);
++    if(auto v = getenv("T_BLSP")) rdp.timing.blendOnlySpan = atof(v);
++    if(auto v = getenv("T_BLSPW")) rdp.timing.blendOnlySpanWide = atof(v);
++    if(auto v = getenv("T_BLTRI")) rdp.timing.blendOnlyTri = atof(v);
 +    if(auto v = getenv("T_VIAA2")) rdp.timing.viFactorAA2 = atof(v);
 +    if(auto v = getenv("T_VIRMW")) rdp.viRmwOnly = atoi(v);
++    if(auto v = getenv("T_VICLASS")) rdp.viClass = atoi(v);
++    if(auto v = getenv("T_CLIPMODEL")) rdp.clipModel = atoi(v);
++    if(auto v = getenv("T_ZCB")) rdp.zcmpBlendSpan = atof(v);
++    if(auto v = getenv("T_ZCBMODEL")) rdp.zcbModel = atoi(v);
++    if(auto v = getenv("T_TRIFLOOR")) rdp.triFloor = atoi(v);
++    if(auto v = getenv("T_ZSP")) rdp.timing.depthSpan = atof(v);
++    if(auto v = getenv("T_CLIPFAR")) rdp.timing.clipRow = atof(v);
++    if(auto v = getenv("T_M15")) rdp.model15 = atoi(v);
++    if(auto v = getenv("T_WIDENMIN")) rdp.widenMin = atof(v);
++    if(auto v = getenv("T_WIDENALL")) rdp.widenAll = atoi(v);
++    if(auto v = getenv("T_CVG")) rdp.cvgModel = atoi(v);
++    if(auto v = getenv("T_CVG0")) rdp.cvg0Row = atof(v);
++    if(auto v = getenv("T_ZWIDE")) rdp.zWide = atof(v);
++    if(auto v = getenv("T_ROWABOVE")) rdp.timing.rowAbove = atof(v);
++    if(auto v = getenv("T_ZSPW")) rdp.timing.depthSpanWide = atof(v);
++    if(auto v = getenv("T_CLIPY")) rdp.timing.clipRowAbove = rdp.timing.clipRowBelow = atof(v);
++    if(auto v = getenv("T_CLIPYA")) rdp.timing.clipRowAbove = atof(v);
++    if(auto v = getenv("T_CLIPYB")) rdp.timing.clipRowBelow = atof(v);
 +    if(auto v = getenv("T_VIAA2WS")) rdp.timing.viWidthScaleAA2 = atof(v);
 +    if(auto v = getenv("T_VIAA3")) rdp.timing.viFactorAA3 = atof(v);
 +    if(auto v = getenv("T_VINTSC")) rdp.timing.viNtscScale = atof(v);
 +    if(auto v = getenv("T_VIXS")) rdp.timing.viContendScale = atof(v);
++    if(auto v = getenv("T_VIXK")) rdp.timing.viContendKinds = atoi(v);
++    if(auto v = getenv("T_DMAPLACE")) rdp.timing.dmaPlace = atoi(v);
++    if(auto v = getenv("T_RSPRUN")) rdp.timing.rspBeside = atof(v);
++    if(auto v = getenv("T_CPUPLACE")) rdp.timing.cpuPlace = atoi(v);
++    if(auto v = getenv("T_CPUACT")) rdp.timing.cpuAct = atoi(v);
++    if(auto v = getenv("T_AITASK")) rdp.timing.audioSampleListTask = atof(v);  //0032; series v25: T_AITASK=0 T_LOADVI=0
++    if(auto v = getenv("T_LOADVI")) rdp.timing.loadVi = atof(v);
++    if(auto v = getenv("T_VIPIC")) rdp.timing.viPicture = atof(v);  //0031: the VI parts inside the picture
++    if(auto v = getenv("T_VIPICM")) { if(!atoi(v)) vi.pictureAlways = true, rdp.timing.viPicture = 1.0; }  //0 = series v25
++    rdp.timing.cpuLossData = rdp.timing.contendCpu; rdp.timing.cpuLossInstruction = rdp.timing.contendCpuI;  //where the per-frame average starts (the knobs above come after the reset)
++    if(auto v = getenv("T_RSPRUNVI")) rdp.timing.rspBesideVi = atof(v);
++    if(auto v = getenv("T_DMACOL")) rdp.timing.dmaColor = atof(v);
++    if(auto v = getenv("T_DMADEP")) rdp.timing.dmaDepth = atof(v);
++    if(auto v = getenv("T_VIXD")) rdp.timing.viContendDma = atof(v);
++    if(auto v = getenv("T_VIXD2")) rdp.timing.viContendDmaAA2 = atof(v);
++    if(auto v = getenv("T_VIXC")) rdp.timing.viContendCpu = atof(v);
++    if(auto v = getenv("T_VIXC2")) rdp.timing.viContendCpuAA2 = atof(v);
++    if(auto v = getenv("T_VIXI")) rdp.timing.viContendCpuI = atof(v);
++    if(auto v = getenv("T_VIXI2")) rdp.timing.viContendCpuIAA2 = atof(v);
 +    if(auto v = getenv("T_VISTALL_D")) cpu.viStallCycles = atoi(v);
 +    if(auto v = getenv("T_VISTALL_I")) cpu.viStallI = atoi(v);
 +    if(auto v = getenv("T_VISTALL_W")) cpu.viStallW = atoi(v);
@@ -2784,12 +3456,25 @@ index 00000000..467dd7d9
 +    if(auto v = getenv("T_RSP")) rsp.rspSlowdown = atoi(v);
 +    if(auto v = getenv("T_DMA_RATE")) rsp.dmaRate = atof(v);
 +    if(auto v = getenv("T_DMAXB")) rsp.dmaContendBase = atof(v);
++    if(auto v = getenv("T_DMAXBW")) rsp.dmaContendBaseW = atof(v);
++    if(auto v = getenv("T_DMAMODEL")) rsp.dmaModel = atoi(v);
++    if(auto v = getenv("T_DMAWLAT")) rsp.dmaWriteLatency = atoi(v);
++    if(auto v = getenv("T_CLKFIX")) rdp.clockFix = atoi(v);
++    if(auto v = getenv("T_CLKSCALE")) rdp.timing.calibration = atof(v);
++    if(auto v = getenv("T_CLKSCALED")) rdp.clockScaleDelay = atoi(v);
++    if(auto v = getenv("T_PLACE")) rdp.placeModel = atoi(v);
++    if(auto v = getenv("T_STARTV")) rdp.startModel = atoi(v);
++    if(auto v = getenv("T_VIWAA2")) rdp.viWholeAA2 = atoi(v);
++    if(auto v = getenv("T_AI")) rdp.audioModel = atoi(v);
++    if(auto v = getenv("T_DMAGAP")) rsp.dmaGapClocks = atof(v);
++    if(auto v = getenv("T_DMAXBC")) rsp.dmaContendBaseCont = atof(v);
++    if(auto v = getenv("T_DMAXW")) rsp.dmaContendW = atof(v);
 +    if(auto v = getenv("T_DMAVIX")) rsp.dmaContendVi = atoi(v) != 0;
 +    if(auto v = getenv("T_DMA_LAT")) rsp.dmaLatency = atoi(v);
 +    if(auto v = getenv("T_DMA_VI")) rsp.dmaViFactor = atof(v);
 +    if(auto v = getenv("T_DMA_CPUX")) rsp.dmaCpuPenalty = atoi(v);
 +    if(auto v = getenv("T_STALL_DMA")) rsp.dmaCpuStall = atoi(v);
-+    if(auto v = getenv("T_ZPASS")) rdp.timing.zPassFraction = atof(v), rdp.timing.zPassAuto = false;
++    if(auto v = getenv("T_ZPASS")) rdp.timing.zPassFraction = atof(v), rdp.timing.zPassLoss = atof(v), rdp.timing.zPassAuto = false;
 +  }
 +  if(auto v = getenv("ARES_RDP_TIMING")) {
 +    using namespace ares::Nintendo64;

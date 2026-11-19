@@ -1,7 +1,7 @@
-From 2623d6e27d7e1e1a014cf9dfeae2c5db1d472f92 Mon Sep 17 00:00:00 2001
+From 00050f352b9caae34ab72883cad8835530e21844 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 17:18:34 +0900
-Subject: [PATCH 10/12] n64: DPC_CURRENT follows the modelled RDP progress, so
+Subject: [PATCH 10/32] n64: DPC_CURRENT follows the modelled RDP progress, so
  the RSP waits for the FIFO (task_timing v20)
 
 The renderer consumes a DPC_START..DPC_END range the moment DPC_END is written and
@@ -24,9 +24,6 @@ in work inside a range; DPC_END once everything is done). With that the v20 ROM 
 same 0.05-0.3 VI gap in ares, and the intro's frame pacing takes the shape measured on the
 console. The ranges are not saved in save states: after a load DPC_CURRENT reads as DPC_END
 until the next DPC_END write.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/rdp/io.cpp            | 21 ++++++++++++++++++++-
  ares/n64/rdp/rdp.cpp           |  1 +

@@ -1,7 +1,7 @@
-From bc6fbd9a894e092d1c57811e6feb8b89b061ebc1 Mon Sep 17 00:00:00 2001
+From f7ab84687b7cc830a6c919a035d2576ed3c6a1aa Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 08:26:33 +0900
-Subject: [PATCH 08/12] n64: CPU write buffer, FPU operand costs and cache-op
+Subject: [PATCH 08/32] n64: CPU write buffer, FPU operand costs and cache-op
  timing from hardware (cpu_timing v18, rdp_timing v17)
 
 cpu_timing v18 measured what v14 could not separate:
@@ -25,9 +25,6 @@ rdp_timing v17 replayed the game display lists beside combined CPU/RSP loads: th
 add up (no super-additive term), a CPU write-back costs the RDP about 1 clock instead of
 5, and each uncached CPU write costs it about 4 (2.7 with the VI off, 5 in the games' VI
 mode), which was not modelled.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/cpu/cpu.cpp             | 38 ++++++++++++++++++++++++---
  ares/n64/cpu/cpu.hpp             | 44 ++++++++++++++++++++++----------
@@ -299,7 +296,7 @@ index ffd72d61..76a1f634 100644
        [&]() -> void {
          fsqrt64_f0();
 diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
-index 498b5ab0..632e64e7 100644
+index a7fe6ca0..5348205d 100644
 --- a/ares/n64/cpu/recompiler.cpp
 +++ b/ares/n64/cpu/recompiler.cpp
 @@ -694,7 +694,7 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {

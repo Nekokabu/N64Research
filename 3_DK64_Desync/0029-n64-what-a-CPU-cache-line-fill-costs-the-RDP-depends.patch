@@ -1,0 +1,303 @@
+From 62eaca871a141965692badc33773983e70ba9e6e Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Wed, 18 Nov 2026 21:57:22 +0900
+Subject: [PATCH 29/32] n64: what a CPU cache line fill costs the RDP depends
+ on what the RDP is doing (rdp_timing v60 to v68)
+
+Since patch 0028 a CPU data cache fill in a megabyte the RDP does not use
+cost the RDP 9.95 clocks and an instruction cache fill 6.1, whatever the
+RDP was drawing. On the console the loss differs from list to list
+(rdp_timing v61, the CPU's fills beside 29 game lists, VI off; data fill
+/ instruction fill):
+
+  MGC 2011 demo, write-only parts        11.0 / 7.0
+  MGC 2011 demo, part 5                  10.4 / 6.3
+  MGC 2011 demo, blended part             9.0 / 5.7
+  Beetle Adventure Racing, first scene    9.6 / 6.7
+  Beetle Adventure Racing, second scene   8.8 / 5.8
+  Donkey Kong 64                          8.2 / 5.2
+
+rdp_timing v63 to v68 measured the loss beside lists of one kind of work
+each, and beside game lists with one kind of work removed:
+
+  fill rectangles, 33 pixels and wider   12.2 / 11.9   (narrower: 7.1 / 5.6)
+  copy rectangles                         6.1 /  4.6
+  texture loads                           4.2 /  4.0
+  triangle set-up, state commands         4.6 /  4.4
+  spans passing the depth test           10 to 12 / 6 to 8, whatever the width
+  spans failing the depth test            9.7 down to 3 / 5 down to 2, the wider the less
+  blended spans without depth            10 to 11.6 / 6 to 7.6
+  write-only spans                       13 to 14 / 9.4 down to 5.8 (65 pixels and wider: 5.5 / 3.6)
+
+(the synthetic triangles of v60 to v64 all had the same depth, so their
+wide spans mostly failed the test; v65 drew them far to near.) What share
+of the depth-compared spans passes also matters: the same game list costs
+8.0 to 10.1 clocks per data fill with every first draw passing and 5.7
+to 7.8 with every test failing (v65). 1 / overdraw of the last frame is
+used for that share (Donkey Kong 64: 0.57, measured 0.56 in v67).
+
+RDP::timingSpan() and the texture loads now sum each frame's time by
+kind (RDP::timingLoss), the rest of the frame's time counts as set-up,
+and at Sync_Full the average becomes what the CPU's transfers cost
+beside the next frame. The terms of patch 0028 for the place of the
+transfer and the VI's factors of patch 0025 are unchanged.
+
+Prediction against the console over the 78 lists and variants of v61 to
+v65, nothing fitted: rms 0.73 clocks (data fill) and 0.63 (instruction
+fill); with the two constants 1.56 and 0.88. Largest remaining
+differences: Beetle Adventure Racing's second scene +0.8 / +0.5 and
+Donkey Kong 64 +0.5 / +0.7.
+
+Results in the test harness (series v24 against v23): Donkey Kong 64's
+DKTV demo 10 / 378 / 35 frames of delta 2 / 3 / 4 and more (was 7 / 371 /
+42; console 9 / 385 to 391 / 25) and +0.8% VI over the demo (was +1.3%);
+Beetle Adventure Racing's intro 238 / 321 frames in the two segments (was
+236 / 316; console 231 / 325); the MGC 2011 demo's "@" frame +34 VI and
+the start of part 4 +11 VI (was +32 / +14). rdp_timing v61 run in the
+harness, data fill by scene against the console: MGC -0.2 clocks, BAR's
+first scene +0.1, its second scene +1.0, DK64 +0.6 (was -0.4, +0.4, +1.3,
++1.8).
+
+The losses above were read from DPC_CLOCK, which on the console keeps
+counting until the test ROM notices the end of the list: up to one chunk
+of the CPU load later (about 7k clocks for the data loads, 30k for the
+instruction load). DPC_PIPEBUSY stops with the RDP and gives 0.03 to 0.1
+clocks less per data fill and 0.2 to 0.5 less per instruction fill
+(v61). The values of this patch are the DPC_CLOCK ones.
+---
+ ares/n64/rdp/rdp.hpp           | 19 +++++++-
+ ares/n64/rdp/serialization.cpp |  7 +++
+ ares/n64/rdp/timing.cpp        | 82 +++++++++++++++++++++++++++++-----
+ 3 files changed, 97 insertions(+), 11 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 140739bf..1f68b44e 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -84,7 +84,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto contendScale(u32 kind) -> f64;
+   enum : u32 { CpuDataFill, CpuInstructionFill, CpuWriteBack, CpuUncachedWrite };
+   auto timingCpu(u32 kind, f64 clocks, u32 address) -> f64;
+-  auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
++  auto timingLoss(f64 cost, f64 data, f64 instruction) -> void;
++  auto timingSpan(s32 x, s32 y, u32 pixels, bool rectangle = false) -> f64;
+   auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
+   auto timingPlacement(s32 row) -> f64;
+   auto timingAudio(u32 address) -> void;
+@@ -164,6 +165,17 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    cpuColor[3] = {2.4, 5.8, 1.9};
+     f64    cpuDepth[3] = {1.5, 3.4, 2.15};
+     f64    cpuVi[3]    = {0.72, 1.8, 0.2}, cpuViAA2[3] = {0.38, 0.85, 0.2};
++    //what a cache line fill costs the RDP also depends on what the RDP is doing meanwhile (rdp_timing v60 to v68: the
++    //CPU's fills beside 78 game lists and variants of them, and beside lists of one kind of work each, VI off, in a
++    //megabyte the list does not use). Beside a list of fills of 33 pixels and more a data fill costs 12.2 clocks and an
++    //instruction fill 11.9, beside texture loads 4.2 / 4.0, beside triangle set-up and state commands 4.6 / 4.4; spans
++    //that pass the depth test 10 to 12 / 6 to 8 whatever their width, spans that fail it 9.7 down to 3 / 5 down to 2
++    //the wider they are; the values per kind of span are in timingSpan. Each frame's time is summed by kind, and the
++    //transfers beside the next frame cost the average: contendCpu and contendCpuI are where that average starts, and
++    //the other data transfers (write-back, uncached write) follow the data fill in proportion. Against the console
++    //over the 78 lists: rms 0.73 clocks (data fill) and 0.63 (instruction fill), 1.56 and 0.88 with the two constants.
++    f64    cpuLoad[2] = {4.2, 4.0};  //texture loads: data fill, instruction fill
++    f64    cpuRest[2] = {4.6, 4.4};  //triangle set-up, state commands and whatever else is not a span or a load
+     //RDP clocks lost to an SP DMA (rdp_timing v52; the CPU starts transfers of 64 B to 1 KiB beside four game lists):
+     //reading RDRAM 12.2 / 28.5 / 50.6 / 74.3 / 150 for 64 / 168 / 344 / 512 / 1024 B back to back, writing it
+     //11.2 / 25.5 / 48.7 / 71.5 / 143; after a pause the first costs more (168 B read: 28.3, 29.6, 30, 31.5, 32.5 after
+@@ -200,6 +212,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     n1     atomicPrim;             //Set_Other_Modes bits the model needs beyond the cycle type and depth/image read
+     n1     antialias;
+     u64    frameZPixels;           //depth-tested pixels drawn since the last Sync_Full
++    f64    zPassLoss = 1.0;        //share of depth-tested pixels taken to pass for what a CPU transfer costs: 1 / overdraw of the last frame
++    f64    frameWork;              //clocks of work queued since the last Sync_Full, as priced (before calibration and the VI's factor)
++    f64    lossWork;               //the part of it that timingLoss has counted (spans and loads)
++    f64    lossData, lossInstruction;                         //that time x clocks lost per data / instruction fill
++    f64    cpuLossData = 9.95, cpuLossInstruction = 6.1;      //the last finished frame's average loss per data / instruction fill
+ 
+     //state decoded from the command stream (only what the model needs)
+     n2     cycleType;
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index fde26238..fc2ce98c 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -40,6 +40,13 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.depthSeen);
+   s(timing.depthLast);
+   s(timing.zPassFraction);
++  s(timing.zPassLoss);
++  s(timing.frameWork);
++  s(timing.lossWork);
++  s(timing.lossData);
++  s(timing.lossInstruction);
++  s(timing.cpuLossData);
++  s(timing.cpuLossInstruction);
+   s(timing.frameZPixels);
+   s(timing.atomicPrim);
+   s(timing.antialias);
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 73571fc4..4839e7be 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -68,6 +68,9 @@ auto RDP::timingReset() -> void {
+   timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
++  timing.zPassLoss = timing.zPassAuto ? 1.0 : timing.zPassFraction;
++  for(u32 n : range(2)) { timing.cpuLoad[n] = t.cpuLoad[n]; timing.cpuRest[n] = t.cpuRest[n]; }
++  timing.cpuLossData = timing.contendCpu; timing.cpuLossInstruction = timing.contendCpuI;
+   timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
+   timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
+   timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
+@@ -96,6 +99,7 @@ auto RDP::timingAudio(u32 address) -> void {
+ //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
+ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+   if(!timing.enable || cycles + measured <= 0.0) return;
++  timing.frameWork += cycles;
+   //in AA mode 2 (resample only, the MGC demo's) the VI slows the whole list, not only its spans and loads: the console's
+   //lists take 1.026 to 1.035 times as long with the VI on whatever they consist of (rdp_timing v29 / v42 / v53; the
+   //factor on spans and loads alone gave 1.023 to 1.026, least for the lists of small triangles)
+@@ -112,15 +116,26 @@ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+ //what a CPU transfer costs the RDP: 'clocks' in a megabyte the RDP does not use with the VI off, more where the
+ //RDP or the VI works (rdp_timing v59). 'address' is the RDRAM address of the transfer, ~0 when it is not known.
+ auto RDP::timingCpu(u32 kind, f64 clocks, u32 address) -> f64 {
+-  f64 extra = 0.0;
++  f64 extra = 0.0, place = 0.0;
+   if(kind < CpuUncachedWrite && address < 0x0080'0000) {
+     u32 megabyte = address >> 20;
+-    if(megabyte == (timing.colorAddress & 0xffffff) >> 20) clocks += timing.cpuColor[kind];
+-    else if((timing.depthSeen || timing.depthLast) && megabyte == (timing.depthAddress & 0xffffff) >> 20) clocks += timing.cpuDepth[kind];
+-    else if(!command.source && megabyte == (u32)command.current >> 20) clocks += timing.cpuList[kind];
++    if(megabyte == (timing.colorAddress & 0xffffff) >> 20) place = timing.cpuColor[kind];
++    else if((timing.depthSeen || timing.depthLast) && megabyte == (timing.depthAddress & 0xffffff) >> 20) place = timing.cpuDepth[kind];
++    else if(!command.source && megabyte == (u32)command.current >> 20) place = timing.cpuList[kind];
+     if(vi.active() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) extra = vi.io.antialias < 2 ? timing.cpuVi[kind] : timing.cpuViAA2[kind];
+   }
+-  return clocks * contendScale(ContendCpu) + extra;
++  //what the RDP did in the last finished frame decides what a transfer in an unused megabyte costs it (timingLoss)
++  if(kind == CpuInstructionFill) clocks = timing.cpuLossInstruction;
++  else clocks = clocks * timing.cpuLossData / timing.contendCpu;
++  return (clocks + place) * contendScale(ContendCpu) + extra;
++}
++
++//'cost' clocks of work during which a CPU data / instruction cache line fill costs the RDP 'data' / 'instruction'
++//clocks (rdp_timing v60 to v68). At each Sync_Full the frame's average becomes what the next frame's transfers cost.
++auto RDP::timingLoss(f64 cost, f64 data, f64 instruction) -> void {
++  timing.lossData += cost * data;
++  timing.lossInstruction += cost * instruction;
++  timing.lossWork += cost;
+ }
+ 
+ //another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
+@@ -200,7 +215,7 @@ auto RDP::contendScale(u32 kind) -> f64 {
+ }
+ 
+ //cost of one span of 'pixels' pixels whose first pixel is at (x, y) of the color image
+-auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
++auto RDP::timingSpan(s32 x, s32 y, u32 pixels, bool rectangle) -> f64 {
+   if(pixels == 0) return 0.0;
+   u32 bytes = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
+   u32 stride = (timing.colorWidth + 1) * bytes;
+@@ -313,6 +328,38 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+     cost += (stride > 640 ? timing.fillSpanWide : timing.fillSpan) + timing.fillPixel * w;
+   }
+ 
++  { //what a CPU cache line fill costs the RDP while it draws this span (data fill, instruction fill), by span width up
++    //to 2, 4, 8, 16, 32, 64 pixels and beyond. Measured beside lists of one kind of span each, VI off, the fills in a
++    //megabyte the list does not use (rdp_timing v63 / v64: fill, copy, write-only, failing spans; v65: triangles drawn
++    //far to near, so that every span passes; v68: a rectangle's write-only spans)
++    static const f64 zReadPass[2][7]    = {{12.4, 12.4, 11.9, 11.2,  9.8, 10.5, 11.5}, {6.9, 6.9, 6.9, 7.1, 6.2, 6.65, 8.0}};  //depth compare + update, IMAGE_READ, passing
++    static const f64 zWritePass[2][7]   = {{11.8, 11.8, 11.4, 11.0, 10.8, 10.5, 12.3}, {7.1, 7.1, 6.9, 6.7, 6.5, 6.3,  8.9}};  //the same without IMAGE_READ
++    static const f64 zComparePass[2][7] = {{10.7, 11.7, 11.1, 10.4,  9.0,  9.2,  9.6}, {6.7, 7.3, 7.4, 6.5, 5.8, 5.6,  5.9}};  //depth compare without update, passing
++    static const f64 zReadFail[2][7]    = {{ 9.7,  9.3,  8.6,  8.4,  6.3,  5.2,  5.7}, {5.1, 6.3, 6.1, 5.8, 4.5, 3.4,  2.9}};  //failing the depth test, IMAGE_READ
++    static const f64 zWriteFail[2][7]   = {{ 9.7,  9.3,  8.6,  7.5,  5.0,  3.2,  3.0}, {5.1, 6.0, 5.8, 5.0, 3.2, 1.9,  1.8}};  //failing, no IMAGE_READ
++    static const f64 blend[2][7]        = {{10.3, 11.0, 10.9, 10.8,  9.6, 10.5, 11.6}, {5.9, 6.2, 6.3, 6.9, 5.9, 6.4,  7.6}};  //IMAGE_READ without depth
++    static const f64 writeOnly[2][7]    = {{13.6, 13.6, 13.3, 12.9, 13.4, 14.0,  5.5}, {9.4, 9.4, 8.3, 7.2, 6.5, 5.8,  3.6}};  //no IMAGE_READ, no depth
++    u32 n = pixels <= 2 ? 0 : pixels <= 4 ? 1 : pixels <= 8 ? 2 : pixels <= 16 ? 3 : pixels <= 32 ? 4 : pixels <= 64 ? 5 : 6;
++    f64 data, instruction;
++    if(timing.cycleType == 3) { data = n >= 5 ? 12.15 : 7.1; instruction = n >= 5 ? 11.9 : 5.6; }  //fill: 33 pixels and more, narrower
++    else if(timing.cycleType == 2) { data = 6.1; instruction = 4.6; }                              //copy
++    else if(!timing.zCompare && !timing.zUpdate) {
++      if(timing.imageRead) { data = blend[0][n]; instruction = blend[1][n]; }
++      else if(rectangle) { data = 8.8; instruction = 4.6; }
++      else { data = writeOnly[0][n]; instruction = writeOnly[1][n]; }
++    } else {
++      //a depth-compared span counts as passing for the share 1 / overdraw of the last frame and as failing for the rest
++      //(rdp_timing v65: the same game lists drawn with every test passing and with every test failing; v67: Donkey Kong
++      //64's depth-compared part behaves as if 0.56 of it passed, 1 / overdraw gives 0.57)
++      auto pass = !timing.zUpdate ? zComparePass : timing.imageRead ? zReadPass : zWritePass;
++      auto fail = timing.imageRead ? zReadFail : zWriteFail;
++      f64 q = timing.zCompare ? timing.zPassLoss : 1.0;
++      data = q * pass[0][n] + (1.0 - q) * fail[0][n];
++      instruction = q * pass[1][n] + (1.0 - q) * fail[1][n];
++    }
++    timingLoss(cost, data, instruction);
++  }
++
+   timing.framePixels += pixels;
+   return cost;
+ }
+@@ -471,7 +518,7 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
+   f64 cycles = 0.0;
+   u32 width = px1 > px0 ? px1 - px0 : 0;
+   if(width && py1 > py0) {
+-    for(s32 row = py0; row < py1; row++) cycles += timingSpan(px0, row, width);
++    for(s32 row = py0; row < py1; row++) cycles += timingSpan(px0, row, width, true);
+   }
+   cycles += rdp_tm_prim_overhead((enum rdp_tm_mode)timing.mode, width ? width : 1);
+   timingAdd(cycles, timingPlacement(py0));
+@@ -488,6 +535,14 @@ auto RDP::timingSyncFull() -> void {
+     timingComplete();
+   }
+   timing.syncTargets[timing.syncQueued++] = timing.submitted;
++  //what a CPU cache line fill costs the RDP beside the next frame: this frame's average over its time (timingLoss);
++  //the time that is neither span nor load counts with cpuRest
++  if(timing.frameWork > 0.0) {
++    f64 rest = timing.frameWork > timing.lossWork ? timing.frameWork - timing.lossWork : 0.0;
++    timing.cpuLossData = (timing.lossData + rest * timing.cpuRest[0]) / (timing.lossWork + rest);
++    timing.cpuLossInstruction = (timing.lossInstruction + rest * timing.cpuRest[1]) / (timing.lossWork + rest);
++  }
++  timing.lossData = timing.lossInstruction = timing.lossWork = timing.frameWork = 0.0;
+ }
+ 
+ //advance the RDP by up to 'clocks' system clocks of queued work; returns the clocks consumed
+@@ -527,6 +582,7 @@ auto RDP::timingComplete() -> void {
+       if(f > 1.0) f = 1.0;
+       if(f < 0.5) f = 0.5;
+       timing.zPassFraction = f;
++      timing.zPassLoss = 1.0 / n;  //for what a CPU transfer costs: what is drawn over something else is taken to fail
+     }
+   }
+   timing.frameZPixels = 0;
+@@ -592,14 +648,18 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+   case 0x30: { //Load_TLUT
+     s32 s0 = n12(op >> 44) >> 2, s1 = n12(op >> 12) >> 2;
+     u32 count = s1 >= s0 ? s1 - s0 + 1 : 0;
+-    timingAdd(rdp_tm_load_tlut(count) * timingScale(false));
++    f64 cost = rdp_tm_load_tlut(count) * timingScale(false);
++    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
++    timingAdd(cost);
+   } break;
+ 
+   case 0x33: { //Load_Block
+     s32 s0 = n12(op >> 44), s1 = n12(op >> 12);
+     u32 texels = s1 >= s0 ? s1 - s0 + 1 : 0;
+     u32 bytes = texelBytes2(texels) >> 1;
+-    timingAdd(rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false));
++    f64 cost = rdp_tm_load_block((bytes + 1) >> 1) * timingScale(false);
++    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
++    timingAdd(cost);
+   } break;
+ 
+   case 0x34: { //Load_Tile
+@@ -614,7 +674,9 @@ auto RDP::timingCommand(const u64* ops, u32 length) -> void {
+     //rows of the source image further apart than 512 / 1024 bytes cost 1.2 / 2.3 clocks more each (rdp_timing v34: a 32x32
+     //RGBA16 tile out of a 320-pixel-wide image +4.8%, out of a 640-pixel-wide one +8.5%)
+     f64 strideCost = stride >= 1024 ? timing.loadStrideWide : stride >= 512 ? timing.loadStride : 0.0;
+-    timingAdd((rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false));
++    f64 cost = (rdp_tm_load_tile(address, stride, rowBytes, h) + strideCost * h) * timingScale(false);
++    timingLoss(cost, timing.cpuLoad[0], timing.cpuLoad[1]);
++    timingAdd(cost);
+   } break;
+ 
+   case 0x36: { //Fill_Rectangle
+-- 
+2.43.0
+

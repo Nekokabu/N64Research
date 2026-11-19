@@ -1,0 +1,191 @@
+From b149e488d7c45da51098bc904940e90c2aeab253 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 14 Nov 2026 23:17:49 +0900
+Subject: [PATCH 21/32] n64: DPC_CLOCK keeps the remainder of every step; the
+ list prices recalibrated; CPU bus losses (rdp_timing v52/v42)
+
+Since the RDP thread advances in bounded steps, "command.clock += clocks / 3"
+dropped up to two system clocks per step, and DPC_CLOCK ran 1.7% slow in the
+test ROMs' polling loop (2.5% beside a busy CPU) whenever the RDP was drawing.
+rdp_timing v52 shows it directly: DPC_CLOCK over the CPU's count is 1.0006 on
+the console and was 0.975 here. The remainder now carries over.
+
+Every price of the list model was fitted to that register, so the model's real
+time was 1.72% long. 'calibration' (0.9828) scales the prices: the replayed
+lists stay where they were against the console (rdp_timing v29: +0.005% on
+average) and the time the RDP takes now agrees with what the ROMs read.
+
+The clocks the RDP loses to the other bus masters are real clocks and are not
+scaled. The CPU's four were read again from rdp_timing v42 with the fixed
+register (console / here, per operation): data cache fill 10.39 / 10.46,
+instruction cache fill 6.38 / 6.27, random store 13.63 / 13.53, mixed loop
+23.56 / 23.24, uncached write 2.58 / 2.62. The SP DMA's two stay: a transfer
+started by the CPU beside a replayed list costs less (v52), a microcode feeding
+the RDP through its output buffer what they give or more (v41).
+
+An SP DMA writing RDRAM ends 28 system clocks sooner than a read (v52, RDP idle).
+
+rdp_timing v52 also checked the RSP's instruction timing against the console:
+30 loops (scalar, vector, load-use, branches, COP0/COP2 moves, a vertex
+transform) agree within 0.006 cycles per iteration; nothing to change there.
+---
+ ares/n64/rdp/io.cpp            |  2 +-
+ ares/n64/rdp/rdp.cpp           |  7 ++++++-
+ ares/n64/rdp/rdp.hpp           | 27 +++++++++++++++++++++------
+ ares/n64/rdp/serialization.cpp |  1 +
+ ares/n64/rdp/timing.cpp        |  2 ++
+ ares/n64/rsp/dma.cpp           |  2 +-
+ ares/n64/rsp/rsp.hpp           |  4 +++-
+ 7 files changed, 35 insertions(+), 10 deletions(-)
+
+diff --git a/ares/n64/rdp/io.cpp b/ares/n64/rdp/io.cpp
+index be0f086f..9f2cd4e9 100644
+--- a/ares/n64/rdp/io.cpp
++++ b/ares/n64/rdp/io.cpp
+@@ -120,7 +120,7 @@ auto RDP::writeWord(u32 address, u32 data_, Thread& thread) -> void {
+     if(data.bit(6) && !command.crashed) command.tmemBusy = 0;
+     if(data.bit(7) && !command.crashed) command.pipeBusy = 0;
+     if(data.bit(8) && !command.crashed) command.bufferBusy = 0;
+-    if(data.bit(9)) command.clock = (Thread::clock - thread.clock) / 3;
++    if(data.bit(9)) { command.clock = (Thread::clock - thread.clock) / 3; timing.clockRemainder = 0; }
+   }
+ 
+   if(address == 4) {
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 7f38701e..1dbff502 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -39,7 +39,12 @@ auto RDP::main() -> void {
+       clocks = timingStep(clocks);
+     }
+     step(clocks);
+-    command.clock += clocks / 3;
++    //DPC_CLOCK counts RCP clocks (3 system clocks). The steps above are bounded by the work in flight, so the
++    //remainder of each has to carry over: dropping it made the register run 1.7-2.5% slow whenever the RDP was
++    //drawing (rdp_timing v52: DPC_CLOCK over the CPU's count is 1.0006 on the console)
++    timing.clockRemainder += clocks;
++    command.clock += timing.clockRemainder / 3;
++    timing.clockRemainder %= 3;
+   }
+ }
+ 
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 6407a67e..77cf74de 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -94,6 +94,12 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   struct Timing {
+     //tunables
+     bool   enable = true;
++    //every price of a command, span and primitive below was fitted to DPC_CLOCK as the test ROMs read it, on the
++    //console and in ares. Up to series v15 ares' register dropped the remainder of every step (rdp.cpp) and read
++    //1.72% low in the ROMs' polling loop, so the fitted prices are that much too long in real clocks. With the
++    //register fixed, this factor leaves every replayed list where it was against the console (rdp_timing v29:
++    //+0.005% on average) and makes the time the RDP really takes agree with what the ROMs report.
++    f64    calibration = 0.9828;
+     //the other bus masters are charged as they happen (timingDelay) instead of a fixed factor
+     f64    contentionZ = 1.0;      //scale on read-modify-write spans (image read / depth) beyond the per-transfer charges below
+     f64    contentionPlain = 1.0;  //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
+@@ -105,17 +111,25 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+     f64    viContendScale = 2.4;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*2.4 at 320x16 AA0 (task_timing v20b: a
+                                    //CPU line fill costs the RDP 10.4 clocks with the VI off and 13.3 in the game's VI mode; v12 x1.25, v17 x1.42)
+-    //RDP clocks lost to each transfer of another bus master while it has work in flight (rdp_timing v10, RDP drawing a game list):
+-    f64    contendCpu = 10.0;      //a CPU data cache line fill (16 bytes): 10.4 with the VI off under a real task (task_timing v20b), 9.7 (v17), 11.7 (v10)
+-    f64    contendCpuI = 8.5;      //a CPU instruction cache line fill (32 bytes)
+-    f64    contendCpuW = 1.0;      //a CPU data cache write-back (16 bytes; rdp_timing v17: a random load+store loop costs the RDP about two fills' worth, not two fills and two write-backs)
+-    f64    contendCpuU = 4.0;      //an uncached CPU write (rdp_timing v17: 2.7 with the VI off, 5 in the games' VI mode)
++    //RDP clocks lost to each transfer of another bus master while it has work in flight (real clocks, not scaled by
++    //'calibration'). The CPU's four are rdp_timing v42 (the CPU loading the bus beside nine replayed game lists, VI off)
++    //read again with the fixed DPC_CLOCK: the console loses 10.39 clocks per dependent data cache fill, 6.38 per
++    //instruction cache fill, 13.63 per random store (a fill and a write-back), 23.56 per iteration of the mixed loop
++    //and 2.58 per uncached write; these values give 10.46 / 6.27 / 13.53 / 23.24 / 2.62
++    f64    contendCpu = 10.4;      //a CPU data cache line fill (16 bytes): also 10.4 with the VI off under a real task (task_timing v20b)
++    f64    contendCpuI = 5.8;      //a CPU instruction cache line fill (32 bytes)
++    f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
++    f64    contendCpuU = 2.6;      //an uncached CPU write
+     f64    contendDma = 1.2;       //per 8 bytes of SP DMA, plus contendDmaBase per transfer: the RDP only gets about 36 clocks of
+                                    //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
+     f64    contendDmaBase = 9.0;   //an isolated transfer costs a few clocks more than a back-to-back one: F3DEX2's 1164 DMAs per frame
+                                    //(168 B list fetches, 344 B output flushes, vertex and matrix loads) cost the RDP 51 clocks each with the VI
+                                    //off (task_timing v20b: 0.057 VI per frame; the v19b rule gives 45, this 48) and 47-71 in the game's VI mode
+-                                   //depending on the console (PAL/NTSC); the contendScale factor (x1.28) sits between the two
++                                   //depending on the console (PAL/NTSC); the contendScale factor (x1.28) sits between the two.
++                                   //Transfers the CPU starts beside a replayed list cost less (rdp_timing v52: reads 3.5 + 1.11 per
++                                   //8 bytes, writes 2.4 + 1.07, slightly more after a pause; v42: 9.2 at 64 B, 72 at 512 B), but a
++                                   //microcode feeding the RDP through an output buffer costs it what these two give or more (v41:
++                                   //343-384 clocks per 1 KiB read + write, 347-369 here), so they stay until the two are told apart
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
+@@ -162,6 +176,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     bool   memoryBound;            //'mode' reads the color or depth buffer for every pixel
+     f64    pipeCycles;             //pixel-pipeline floor per pixel for 'mode'
+     f64    accumulated;            //fractional RDP clocks not yet submitted
++    u32    clockRemainder = 0;     //system clocks not yet counted in DPC_CLOCK
+ 
+     //work accounting, in system clocks (3 per RDP clock)
+     u64    submitted;              //total work submitted
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index 34c57415..5fb8cebf 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -36,6 +36,7 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.memoryBound);
+   s(timing.pipeCycles);
+   s(timing.accumulated);
++  s(timing.clockRemainder);
+   s(timing.zPassFraction);
+   s(timing.frameZPixels);
+   s(timing.atomicPrim);
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 7cdd7a4b..faabcaf7 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -77,6 +77,7 @@ auto RDP::timingReset() -> void {
+ //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
+ auto RDP::timingAdd(f64 cycles) -> void {
+   if(!timing.enable || cycles <= 0.0) return;
++  cycles *= timing.calibration;
+   timing.frameCycles += (u64)cycles;
+   timing.accumulated += cycles * 3.0;
+   u64 work = (u64)timing.accumulated;
+@@ -87,6 +88,7 @@ auto RDP::timingAdd(f64 cycles) -> void {
+ 
+ //another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
+ //everything queued, including the Sync_Full interrupts already waiting, completes that much later
++//(real clocks: the losses in rdp.hpp are stated as measured, without the calibration of the list prices)
+ auto RDP::timingDelay(f64 cycles) -> void {
+   if(!timing.enable || cycles <= 0.0 || timing.pending == 0 || command.freeze) return;
+   timing.accumulated += cycles * 3.0;
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 94135115..77abaa38 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -18,7 +18,7 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+     dma.current = dma.pending;
+     dma.busy    = dma.full;
+     dma.full    = {0,0};
+-    dmaQueue(dmaClocks(dma.current.length) + DmaClocksPerTransfer, thread);
++    dmaQueue(dmaClocks(dma.current.length) + (dma.busy.read ? DmaClocksPerTransfer : DmaClocksPerWrite), thread);
+     rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());  //the RDP loses the bus meanwhile
+   }
+ }
+diff --git a/ares/n64/rsp/rsp.hpp b/ares/n64/rsp/rsp.hpp
+index c7655458..1eec719f 100644
+--- a/ares/n64/rsp/rsp.hpp
++++ b/ares/n64/rsp/rsp.hpp
+@@ -264,7 +264,9 @@ struct RSP : Thread, Memory::RCP<RSP> {
+   //an SP DMA takes 38 RSP cycles plus 0.15 per byte on hardware (rsp_timing v16/v19b: 8 B 38, 64 B 44,
+   //256 B 70, 512 B 108, 1 KiB 186, 3.5 KiB 581; writes to RDRAM 32 + 0.145/B), in system clocks (3 per
+   //RSP cycle): 114 + 3.6 per 8 bytes
+-  enum : u32 { DmaClocksPerTransfer = 114 };
++  //rdp_timing v52 (RDP idle, 64 B - 1 KiB): a write to RDRAM is over 7 CPU count ticks (28 system clocks) sooner
++  //than a read of the same length
++  enum : u32 { DmaClocksPerTransfer = 114, DmaClocksPerWrite = 86 };
+   static constexpr auto dmaClocks(u32 length) -> u32 { return (length + 8) * 9 / 20; }  //3.6 per 8 bytes
+   //the DMA shares RDRAM with the VI and the CPU (rsp_timing v19): in the games' 320x240 AA modes it takes
+   //18% longer (4% in the ROM's replicate mode), and every CPU cache line transfer that overlaps it delays
+-- 
+2.43.0
+

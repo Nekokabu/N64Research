@@ -1,7 +1,7 @@
-From 18e11d1cac94971bd04668b8e2244c8bd64f07ba Mon Sep 17 00:00:00 2001
+From 57459348e5e61b414067a744d647e54bb5e5c921 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 03:45:24 +0900
-Subject: [PATCH 06/12] n64: SP DMA timing from hardware (rsp_timing v16)
+Subject: [PATCH 06/32] n64: SP DMA timing from hardware (rsp_timing v16)
 
 An RSP test ROM timed 31 instruction kernels and DMA transfers of 8 to 3584 bytes on
 two consoles. The instruction timing (dual issue, the 4-cycle dependent vector result,
@@ -10,9 +10,6 @@ load-use, branches, COP0 reads) matches ares exactly; the DMA does not: a transf
 DMEM to RDRAM 32 + 0.145 per byte) where ares charged 1 system clock per 8 bytes.
 Charge 114 system clocks per transfer and 4 per 8 bytes, and let the transfer delay the
 RDP's queued work as the other bus masters do.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/rsp/dma.cpp | 6 ++++--
  ares/n64/rsp/rsp.hpp | 3 +++

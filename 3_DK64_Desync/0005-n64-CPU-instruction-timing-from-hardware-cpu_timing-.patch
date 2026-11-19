@@ -1,7 +1,7 @@
-From 100996eb1d47fcdced922ee16a47072d4f2d6ea6 Mon Sep 17 00:00:00 2001
+From 42d529687b6e4a02145703c117088994f8431cea Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 03:45:23 +0900
-Subject: [PATCH 05/12] n64: CPU instruction timing from hardware (cpu_timing
+Subject: [PATCH 05/32] n64: CPU instruction timing from hardware (cpu_timing
  v11, v14)
 
 Two test ROMs time loops of VR4300 instructions with the COP0 count on NTSC and PAL
@@ -28,9 +28,6 @@ With these the v11/v14 loops agree with the console to within 1-2 cycles per ite
 except where the FPU's cost depends on operand values (add/sub with cancellation, a 0.0
 dividend) and the 4-entry write buffer, which is not modelled (a burst of more than four
 uncached stores costs ~16 cycles per extra store on the console).
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/cpu/cpu.cpp             |  44 +++++++++++
  ares/n64/cpu/cpu.hpp             |  16 +++-
@@ -1087,7 +1084,7 @@ index a9cac538..47719890 100644
      add64(ProfileDcacheHitsMem, ProfileDcacheHitsMem, imm(1));
    }
 diff --git a/ares/n64/cpu/recompiler.cpp b/ares/n64/cpu/recompiler.cpp
-index 6e624e39..498b5ab0 100644
+index c7f59f2a..a7fe6ca0 100644
 --- a/ares/n64/cpu/recompiler.cpp
 +++ b/ares/n64/cpu/recompiler.cpp
 @@ -680,6 +680,40 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
@@ -1131,7 +1128,7 @@ index 6e624e39..498b5ab0 100644
    for(size_t idx = 0; idx < plan.instructions.size(); idx++) {
      auto& ii = plan.instructions[idx];
      bool firstInstruction = (idx == 0);
-@@ -746,6 +780,18 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+@@ -747,6 +781,18 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
        instructionCycles = 64 * 2;
      }
      emitDeferredCycles += instructionCycles;
@@ -1150,7 +1147,7 @@ index 6e624e39..498b5ab0 100644
      // Synchronize cycles before any branch/helper boundary.
      if(delaySlot || info.branch() || emitCallfEmitted) flushDeferredCycles();
  
-@@ -769,8 +815,13 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
+@@ -773,8 +819,13 @@ auto CPU::Recompiler::emit(u64 vaddr, u32 address, u64 stateKey) -> Block* {
  
      if(slowPaths.size() != slowPathStart) {
        // New slow paths created by this opcode resume right after it.

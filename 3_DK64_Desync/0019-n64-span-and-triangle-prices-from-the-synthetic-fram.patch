@@ -1,0 +1,132 @@
+From 20a4a6a7cac421af794a11b4b8635bcc6ffc5056 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 14 Nov 2026 18:04:18 +0900
+Subject: [PATCH 19/32] n64: span and triangle prices from the synthetic frames
+ now that the scissor cost is modelled (rdp_timing v32/v44/v47/v49)
+
+With the pixels outside the scissor charged, the per-span and per-triangle
+terms that were making up for them are replaced by the console's figures:
+
+- write-only triangles: +6 clocks with texture instead of +42 per triangle
+  (v44/v47/v48: uncut 8-row triangles), and a least time per triangle of
+  15 clocks for the edge words, +9 shade, +31 texture, +10 with IMAGE_READ,
+  plus 11 per row (v32: one-, two- and four-row triangles);
+- blend-only spans (IMAGE_READ, no depth): 12 clocks cheaper into a
+  320-pixel-wide colour image, 7 into a wider one (v33/v40/v49);
+- depth compare without update on a blended span: the blend-only span plus
+  28-63 clocks when the test passes and 10-25 when it fails (v49; the old
+  path came out cheaper than a span without a depth test);
+- depth spans: 10 clocks cheaper (v49, three games' modes).
+
+MGC 2011 demo against the console's task logs: parts 1-5 +0.1 / +0.2 /
+-0.5 / -0.4 / +1.0% (were +0.2 / +0.9 / +2.4 / -1.7 / -2.0%), the closing
+'@' 2 VI early (was 6 late).
+---
+ ares/n64/rdp/rdp.hpp    |  9 ++++++---
+ ares/n64/rdp/timing.cpp | 38 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 04817393..4618918a 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -124,9 +124,12 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    aaSpanCost = 3.5;
+     f64    writeOnlySpan = 1.2;      //extra clocks per write-only span (no image read, no depth), 320-pixel-wide colour image (rdp_timing v31/v32)
+     f64    writeOnlySpanWide = 2.8;  //the same for a colour image wider than 320 pixels (the MGC 2011 demo's 640x480)
+-    f64    writeOnlyTri = 5.0;       //extra clocks per write-only triangle: edges (+5), shade words (+7), texture words (+30)
+-    f64    writeOnlyShade = 7.0;
+-    f64    writeOnlyTexture = 30.0;
++    f64    writeOnlyTri = 0.0;       //extra clocks per write-only triangle: edges, shade words, texture words (+6: rdp_timing v44/v47/v48;
++    f64    writeOnlyShade = 0.0;     //the +5 / +7 / +30 of v32's one-row triangles are the triangle's least time in timingTriangle)
++    f64    writeOnlyTexture = 6.0;
++    f64    blendOnlySpan = 12.0;     //a blend-only span (IMAGE_READ, no depth) is this much cheaper than the tables + spanPenalty, 320-pixel-wide colour image (rdp_timing v33/v40)
++    f64    blendOnlySpanWide = 7.0;  //the same for a wider colour image (rdp_timing v49)
++    f64    depthSpan = 10.0;         //a depth span is this much cheaper than the tables + spanPenalty (rdp_timing v49)
+     f64    clipRow = 11.0;           //clocks for a triangle row with no pixel inside the scissor (rdp_timing v48; v36: 88 for an 8-row triangle off screen)
+     f64    sameBankNarrow = 1.10;    //depth-tested span with the depth buffer in the colour buffer's megabyte of RDRAM, up to 8 px (rdp_timing v35)
+     f64    sameBank1 = 1.20;         //the same, wider spans, 1-cycle
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index b39e4e45..89d298cb 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -63,6 +63,7 @@ auto RDP::timingReset() -> void {
+   timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
+   timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
+   timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
++  timing.blendOnlySpan = t.blendOnlySpan; timing.blendOnlySpanWide = t.blendOnlySpanWide; timing.depthSpan = t.depthSpan; timing.clipRow = t.clipRow;
+   timing.sameBankNarrow = t.sameBankNarrow; timing.sameBank1 = t.sameBank1; timing.sameBank2 = t.sameBank2;
+   timing.loadStride = t.loadStride; timing.loadStrideWide = t.loadStrideWide;
+   timing.colorSize = 2;
+@@ -172,6 +173,7 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+   if(w > 4096) w = 4096;
+ 
+   f64 cost = rdp_tm_span(mode, address, w);
++  bool compareBlend = false;
+   if(timing.cycleType < 2 && (timing.zCompare || timing.zUpdate)) {
+     //the tables hold "every pixel passes" (zpass) and "every pixel fails" (zfail);
+     //blend the two by the assumed pass rate. Compare-only and update-only were
+@@ -193,6 +195,22 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+       //whole (Donkey Kong 64's small triangles: -17% on the console, v28), so the estimated pass rate
+       //is applied to spans up to zFailWidth pixels and wider spans always pay the passing cost.
+       if(w <= (s32)timing.zFailWidth) cost += (fail - pass) * (1.0 - timing.zPassFraction);
++    } else if(timing.zCompare && timing.imageRead) {
++      //depth compare without update on a blended span (the MGC 2011 demo's particles, decals): on the console
++      //it costs the blend-only span plus the depth read, +28 clocks up to 4 pixels, +33 at 8, +43 at 16 and
++      //+63 at 32 when the test passes and +11 / +10 / +13 / +15 / +25 when it fails, the same in the demo's,
++      //Donkey Kong 64's and Beetle Adventure Racing's modes (rdp_timing v49). Adding "compare-only minus
++      //pass" to the blend-only table, as for the unblended case below, came out cheaper than no depth test.
++      auto lerp = [&](f64 a2, f64 a4, f64 a8, f64 a16, f64 a32) -> f64 {
++        if(w <= 2) return a2;
++        if(w <= 4) return a2 + (a4 - a2) * (w - 2) / 2.0;
++        if(w <= 8) return a4 + (a8 - a4) * (w - 4) / 4.0;
++        if(w <= 16) return a8 + (a16 - a8) * (w - 8) / 8.0;
++        return a16 + (a32 - a16) * (w - 16) / 16.0;  //and on at the 16-32 slope
++      };
++      f64 f = w <= (s32)timing.zFailWidth ? timing.zPassFraction : 1.0;
++      cost += lerp(27.6, 28.3, 33.4, 43.2, 63.5) * f + lerp(11.3, 10.1, 12.6, 15.3, 25.2) * (1.0 - f);
++      compareBlend = true;
+     } else {
+       auto partial = timing.zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD;
+       f64 ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
+@@ -207,6 +225,12 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+   cost *= timingScale(timing.memoryBound);
+   if(timing.memoryBound) {
+     cost += timing.spanPenalty;
++    //with the pixels outside the scissor charged (timingTriangle), the per-span prices can follow the
++    //synthetic frames instead of making up for them: a blend-only span (IMAGE_READ, no depth) is 12 clocks
++    //cheaper than the tables + 15 into a 320-pixel-wide colour image and 7 into a wider one (rdp_timing
++    //v33/v40/v49), a depth span 10 (v49: 7-16 passing, 12-20 failing, up to 16 pixels, in three games' modes)
++    if(!(timing.zCompare || timing.zUpdate) || compareBlend) cost -= stride > 640 ? timing.blendOnlySpanWide : timing.blendOnlySpan;
++    else cost -= timing.depthSpan;
+     if(timing.zCompare || timing.zUpdate) {
+       //the depth buffer in the same megabyte of RDRAM as the colour buffer: every depth-tested span costs
+       //10% more up to 8 pixels and 16.5% (2-cycle) / 20% (1-cycle) more beyond, whatever the distance inside
+@@ -308,13 +332,21 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+   if(timing.atomicPrim) cycles += timing.atomicCost;
+   if(timing.antialias && timing.cycleType == 0) cycles += timing.aaSpanCost * (f64)spans;
+   if(!timing.memoryBound && timing.cycleType < 2) {
+-    //a write-only triangle (no image read, no depth) pays for its command words on the console: a
+-    //one-span triangle costs 26 clocks with edges only, 35 with shade and 65 with shade and texture,
+-    //against 20 / 23 / 23 in the tables (rdp_timing v32)
++    //a write-only triangle (no image read, no depth): the texture words add 6 clocks to an 8-row triangle
++    //(rdp_timing v44/v47/v48: 33.4 against 32.7 clocks per span with and without texture)
+     cycles += timing.writeOnlyTri;
+     if(shade) cycles += timing.writeOnlyShade;
+     if(texture) cycles += timing.writeOnlyTexture;
+   }
++  if(timing.cycleType < 2 && spans) {
++    //a triangle cannot finish before its command words are taken in and each of its rows has had its 11
++    //clocks: 15 clocks for the edge words, +9 with shade, +31 with texture, +10 when the spans read the
++    //colour image. One-row write-only triangles cost 26 / 35 / 65 clocks on the console, two rows 77, four
++    //103 (from there on the spans' own cost is the larger), a one-row blended one 76 (rdp_timing v32). The
++    //42 clocks this used to add to every write-only triangle stood in for the scissor cost above.
++    f64 least = 15.0 + (shade ? 9.0 : 0.0) + (texture ? 31.0 : 0.0) + (timing.imageRead ? 10.0 : 0.0) + 11.0 * (f64)spans;
++    if(cycles < least) cycles = least;
++  }
+   timingAdd(cycles);
+ }
+ 
+-- 
+2.43.0
+

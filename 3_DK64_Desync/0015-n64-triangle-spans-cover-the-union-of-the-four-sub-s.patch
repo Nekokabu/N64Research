@@ -1,8 +1,8 @@
-From 65826ce79ff5f7dc2be036b2922529f60d32cc2f Mon Sep 17 00:00:00 2001
+From 3ae41a52619c2db0f08e70db03a95458c75420af Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Mon, 9 Nov 2026 01:48:55 +0900
-Subject: [PATCH] n64: triangle spans cover the union of the four sub-scanlines
- (rdp_timing v36)
+Subject: [PATCH 15/32] n64: triangle spans cover the union of the four
+ sub-scanlines (rdp_timing v36)
 
 The RDP's edge walker evaluates the edges on four sub-scanlines per row and
 writes the span from the leftmost to the rightmost position among them. The

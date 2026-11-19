@@ -1,0 +1,70 @@
+From b23b598e1ce6d392d5df208ca8b618c6c4ed0f9b Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 14 Nov 2026 18:03:40 +0900
+Subject: [PATCH 18/32] n64: span pixels cut off by the scissor are walked from
+ the major edge (rdp_timing v46-v48)
+
+The RDP timing model charged a triangle span only for the pixels inside the
+scissor. On the console (rdp_timing v47/v48: spans 16-512 px beyond a scissor
+at X = 128..512, major edge left and right, slanted edges, both sides) the
+RDP walks each span from the major edge: the pixels in front of the scissor
+on that side cost 1 clock each in 1-cycle mode and 2 in 2-cycle mode (about
+0.5 in fill mode), the part beyond the far scissor edge is free, and a row
+without a single visible pixel costs 11 clocks whatever its width.
+
+Replaying the MGC 2011 demo's lists with one chunk of triangles at a time
+(v46) put the whole console-ares difference of those lists (+5% on some,
+0% on others) on their leading chunk: background triangles that extend
+hundreds of pixels beyond the screen.
+---
+ ares/n64/rdp/rdp.hpp    |  1 +
+ ares/n64/rdp/timing.cpp | 21 +++++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 465dec4a..04817393 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -127,6 +127,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    writeOnlyTri = 5.0;       //extra clocks per write-only triangle: edges (+5), shade words (+7), texture words (+30)
+     f64    writeOnlyShade = 7.0;
+     f64    writeOnlyTexture = 30.0;
++    f64    clipRow = 11.0;           //clocks for a triangle row with no pixel inside the scissor (rdp_timing v48; v36: 88 for an 8-row triangle off screen)
+     f64    sameBankNarrow = 1.10;    //depth-tested span with the depth buffer in the colour buffer's megabyte of RDRAM, up to 8 px (rdp_timing v35)
+     f64    sameBank1 = 1.20;         //the same, wider spans, 1-cycle
+     f64    sameBank2 = 1.165;        //the same, wider spans, 2-cycle
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 227fc6b1..b39e4e45 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -269,6 +269,27 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+       if(a < x0) x0 = a;
+       if(b > x1) x1 = b;
+     }
++    //the scissor does not make the cut-off part of a span free (rdp_timing v46-v48). The RDP walks a span from
++    //the major edge (XH): the pixels in front of the scissor on that side go by at the pipeline rate (1 clock
++    //per pixel in 1-cycle mode, 2 in 2-cycle, about 0.5 in fill / copy), what sticks out beyond the far scissor
++    //edge is free, and a row without a single visible pixel is not walked at all: 11 clocks whatever its width
++    //and side. A span that reads memory overlaps part of its start-up with the walk (15 clocks x rate with
++    //IMAGE_READ, 6 x rate more with depth). The large background triangles of the MGC 2011 demo extend
++    //hundreds of pixels beyond the screen: 4-10% of a list.
++    if(x1 < timing.scissorX0 || x0 >= timing.scissorX1) {
++      cycles += timing.clipRow;
++    } else {
++      bool majorLeft = ops[0] >> 55 & 1;
++      f64 cut = majorLeft ? (x0 < timing.scissorX0 ? (f64)timing.scissorX0 - x0 : 0.0) : (x1 > timing.scissorX1 ? x1 - (f64)timing.scissorX1 : 0.0);
++      if(cut > 2048.0) cut = 2048.0;  //guard against garbage
++      if(cut > 0.0) {
++        bool touching = majorLeft && x1 <= timing.scissorX0;  //ends on the scissor edge: walked, nothing drawn below
++        bool depth = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate);
++        f64 rate = timing.cycleType == 0 ? 1.0 : timing.cycleType == 1 ? 2.0 : 0.5;
++        f64 overlap = timing.cycleType < 2 ? ((timing.imageRead ? 15.0 : 0.0) + (depth ? 6.0 : 0.0)) * rate : 0.0;
++        cycles += touching ? rate * cut + 4.0 + overlap * (depth ? 1.0 : 0.67) : rate * cut - overlap;
++      }
++    }
+     if(x0 < timing.scissorX0) x0 = timing.scissorX0;
+     if(x1 > timing.scissorX1) x1 = timing.scissorX1;
+     if(x1 <= x0) continue;
+-- 
+2.43.0
+

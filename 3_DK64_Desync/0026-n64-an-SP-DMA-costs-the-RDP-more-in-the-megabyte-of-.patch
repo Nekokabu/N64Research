@@ -1,0 +1,164 @@
+From c6668ae8dc607445f25fad233f2e797aca4e5690 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 15 Nov 2026 22:38:03 +0900
+Subject: [PATCH 26/32] n64: an SP DMA costs the RDP more in the megabyte of
+ the colour buffer, of the depth buffer or of the VI's picture (rdp_timing
+ v57)
+
+rdp_timing v57 (NTSC console; SP DMA started by the CPU beside four game
+lists, with the VI off, in the title's VI mode, and in that mode with the
+VI showing the megabyte the DMA uses; the VI confirmed running for every
+row) measured what a transfer costs the RDP by where its RDRAM side is,
+against a megabyte the list does not use:
+
+  megabyte of the colour buffer            +3.0 to 6.2 clocks (4.7)
+  megabyte of the depth buffer, lists      +3.5 to 5.1 (4.3)
+   that use depth (BAR, DK64)
+  megabyte the VI shows, AA modes 0/1      +4.1 to 4.7 for 168 B / 344 B back
+                                           to back, +10.3 / 12.0 for 1024 B,
+                                           +6.5 to 10.4 after a pause
+  the same in the MGC demo's AA mode 2     +1.9 to 2.4, +4.3 / 4.8, +1.5 to 3.5
+
+The first two grow with the VI like the transfer itself (x1.15 to 1.27 at
+320x240, back-to-back transfers included; patch 0025); the VI's term is
+stated in clocks of that VI mode.
+
+In the games these places are common: the Beetle Adventure Racing intro
+reads 21% of its transfers from the colour buffer's megabyte, 38% from the
+depth buffer's and 21% from the one the VI shows; a third of the MGC
+demo's output is written to the colour buffer's megabyte and a third to
+the one the VI shows; DK64 writes its output to the depth buffer's
+megabyte.
+
+dmaContention() adds the terms to the first row of a transfer. Whether the
+list uses the depth buffer is taken per frame (a depth primitive seen in
+this frame or the one before it).
+
+Results in the test harness (series v21 against v20): DK64 title demo
+frame deltas 2 / 3 / 4+ = 8 / 381 / 33, 46 frames differing from the
+console (was 6 / 381 / 36, 51; console 9 / 385-391 / 25). BAR intro 253 /
+326 frames in the two segments (was 255 / 327; console 231 / 325). MGC
+2011 demo: parts 1 to 5 -0.1 / +0.2 / +0.0 / -0.4 / +1.2%, the "@" frame at
+VI 9389 (was 9382; console 9385).
+---
+ ares/n64/rdp/rdp.cpp           |  1 +
+ ares/n64/rdp/rdp.hpp           |  6 ++++++
+ ares/n64/rdp/render.cpp        |  1 +
+ ares/n64/rdp/serialization.cpp |  2 ++
+ ares/n64/rdp/timing.cpp        |  3 +++
+ ares/n64/rsp/dma.cpp           | 17 ++++++++++++++++-
+ 6 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 5ca2ee19..1f7b465c 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -30,6 +30,7 @@ auto RDP::crash(const char *reason) -> void {
+   timing.syncQueued = 0;
+   timing.rangeCount = 0;
+   timing.rangeFresh = 0;
++  timing.depthSeen = timing.depthLast = 0;
+ }
+ 
+ auto RDP::main() -> void {
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 109246bc..f439c7b6 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -130,6 +130,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //running): at 320x240 16-bit AA 0/1 (factor 1.117) an SP DMA costs x1.19 to 1.28, a CPU data cache fill or store
+     //x1.27 to 1.36, a CPU instruction cache fill x1.56 / 1.57; in the MGC demo's AA mode 2 (factor 1.03) x1.07 to 1.14,
+     //x1.10 to 1.16, x1.24 / 1.38
++    //an SP DMA whose RDRAM side is in the megabyte of the colour buffer / of the depth buffer (rdp_timing v57), and in
++    //the megabyte the VI shows (clocks in that VI mode: AA 0/1 = base + per 8 bytes + after a pause; AA 2/3 likewise)
++    f64    dmaColor = 4.7, dmaDepth = 4.3;
++    f64    dmaVi = 3.0, dmaViWrite = 1.9, dmaViUnit = 0.063, dmaViGap = 3.0, dmaViGapWrite = 1.9;
++    f64    dmaViAA2 = 1.5, dmaViUnitAA2 = 0.023, dmaViGapAA2 = 1.1;
+     f64    viContendDma = 1.94, viContendDmaAA2 = 3.2;
+     f64    viContendCpu = 2.75, viContendCpuAA2 = 4.2;
+     f64    viContendCpuI = 4.83, viContendCpuIAA2 = 10.3;
+@@ -223,6 +228,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     Range  ranges[2048];
+     u32    rangeHead, rangeCount;
+     bool   rangeFresh;             //the next range begins at a new DPC_START
++    bool   depthSeen, depthLast;   //a primitive of this frame / of the previous one used the depth buffer (for the SP DMA's placement)
+   } timing;
+ 
+   struct Command {
+diff --git a/ares/n64/rdp/render.cpp b/ares/n64/rdp/render.cpp
+index 8c2c7754..f47e48cf 100644
+--- a/ares/n64/rdp/render.cpp
++++ b/ares/n64/rdp/render.cpp
+@@ -632,6 +632,7 @@ auto RDP::syncTile() -> void {
+ 
+ //0x29
+ auto RDP::syncFull() -> void {
++  timing.depthLast = timing.depthSeen; timing.depthSeen = 0;  //did this frame use the depth buffer (rdp_timing v57)
+   if(!timing.enable) timing.syncFullCount++;
+   if(timing.enable) return;  //completion is signaled by the timing model (timingComplete)
+   if(!command.crashed) {
+diff --git a/ares/n64/rdp/serialization.cpp b/ares/n64/rdp/serialization.cpp
+index c765717b..fde26238 100644
+--- a/ares/n64/rdp/serialization.cpp
++++ b/ares/n64/rdp/serialization.cpp
+@@ -37,6 +37,8 @@ auto RDP::serialize(serializer& s) -> void {
+   s(timing.pipeCycles);
+   s(timing.accumulated);
+   s(timing.clockRemainder);
++  s(timing.depthSeen);
++  s(timing.depthLast);
+   s(timing.zPassFraction);
+   s(timing.frameZPixels);
+   s(timing.atomicPrim);
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index a2f5775d..2b53a8ee 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -58,6 +58,8 @@ auto RDP::timingReset() -> void {
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+   timing.viWidthScale = t.viWidthScale;
+   timing.viContendDma = t.viContendDma; timing.viContendDmaAA2 = t.viContendDmaAA2; timing.viContendCpu = t.viContendCpu; timing.viContendCpuAA2 = t.viContendCpuAA2;
++  timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViWrite = t.dmaViWrite; timing.dmaViUnit = t.dmaViUnit;
++  timing.dmaViGap = t.dmaViGap; timing.dmaViGapWrite = t.dmaViGapWrite; timing.dmaViAA2 = t.dmaViAA2; timing.dmaViUnitAA2 = t.dmaViUnitAA2; timing.dmaViGapAA2 = t.dmaViGapAA2;
+   timing.viContendCpuI = t.viContendCpuI; timing.viContendCpuIAA2 = t.viContendCpuIAA2;
+   timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
+   timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
+@@ -311,6 +313,7 @@ auto RDP::timingPlacement(s32 row) -> f64 {
+   u32 y = row < 0 ? 0 : row;
+   u32 list = (u32)command.current >> 20;
+   bool depth = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate);
++  if(depth) timing.depthSeen = 1;  //for the SP DMA's placement (rsp/dma.cpp)
+   f64 clocks = 0.0;
+   if(list == (timing.colorAddress + y * width * pixel & 0xffffff) >> 20) clocks += timing.listColor;
+   if(depth && list == (timing.depthAddress + y * width * 2 & 0xffffff) >> 20) clocks += timing.listDepth;
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 7381a453..2fd0719c 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -24,7 +24,22 @@ auto RSP::dmaContention(bool start) -> f64 {
+   f64 clocks = dma.busy.read ? t.contendDmaRead + units * t.contendDmaReadUnit : t.contendDmaWrite + units * t.contendDmaWriteUnit;
+   u32 gap = dma.idle / 3;  //RDP clocks since the previous transfer ended
+   if(start && gap >= 38) clocks += (dma.busy.read ? t.contendDmaReadGap : t.contendDmaWriteGap) * log2((f64)(gap > 8192 ? 8192 : gap) / 38.0);
+-  return clocks * rdp.contendScale(RDP::ContendDma);
++  f64 extra = 0.0;
++  if(start) {
++    //where the transfer's RDRAM side is (rdp_timing v57, with the VI off and in the titles' VI modes): in the megabyte
++    //of the colour buffer it costs 3.0 to 6.2 clocks more, in that of the depth buffer of a list that uses depth 3.5 to
++    //5.1; in the megabyte the VI shows, in AA modes 0/1, 4.1 to 4.7 more for 168 B / 344 B back to back, 10.3 / 12.0
++    //for 1024 B and 6.5 to 7.8 after a pause; in the MGC demo's AA mode 2 1.9 to 2.4, 4.3 / 4.8 and 1.5 to 3.5
++    u32 megabyte = (u32)dma.current.dramAddress >> 20;
++    bool depth = t.depthSeen || t.depthLast;  //the frame being drawn, or the one before it, uses the depth buffer
++    if(megabyte == (t.colorAddress & 0xffffff) >> 20) clocks += t.dmaColor;
++    else if(depth && megabyte == (t.depthAddress & 0xffffff) >> 20) clocks += t.dmaDepth;
++    if(vi.active() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) {
++      if(vi.io.antialias < 2) extra = (dma.busy.read ? t.dmaVi : t.dmaViWrite) + units * t.dmaViUnit + (gap >= 38 ? (dma.busy.read ? t.dmaViGap : t.dmaViGapWrite) : 0.0);
++      else extra = t.dmaViAA2 + units * t.dmaViUnitAA2 + (gap >= 38 && dma.busy.read ? t.dmaViGapAA2 : 0.0);
++    }
++  }
++  return clocks * rdp.contendScale(RDP::ContendDma) + extra;
+ }
+ 
+ auto RSP::dmaTransferStart(Thread& thread) -> void {
+-- 
+2.43.0
+

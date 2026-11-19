@@ -1,0 +1,126 @@
+From da058f5e4b2f12a5a156030b51087c055e756b17 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 15 Nov 2026 00:08:48 +0900
+Subject: [PATCH 22/32] n64: a primitive whose commands come from the megabyte
+ it draws into costs more (rdp_timing v53)
+
+rdp_timing v53 replays four game lists with nothing changed but where things
+are in RDRAM. Reading the list from the megabyte of its colour buffer costs
+20951 clocks over 2206 primitives, 7946 / 911, 11631 / 909 and 9134 / 1227
+(9.5 per primitive overall); from the megabyte of its depth buffer 3715 over
+368 primitives that use depth, 9838 / 866 and 9690 / 1179 (9.6), and nothing
+for a list without depth. Any other megabyte is the same within 0.2k clocks.
+With the VI on, a displayed buffer in the megabyte of the command list costs
+5.3 clocks per primitive in the MGC demo's mode and 8.2 in the 320x240 modes.
+
+The MGC 2011 demo keeps its command buffer at 0x79xxxx and draws into
+0x500000 / 0x600000 / 0x700000 in turn, so every third frame pays this (the
+console's task log shows those frames 15k clocks slower than the cheapest);
+Donkey Kong 64's command buffer shares a megabyte with its depth buffer.
+
+The same ROM shows that where the RSP's output buffer is makes no other
+difference (the RSP feed costs the RDP 300 clocks per 1 KiB read + write
+wherever it writes), which accounts for what rdp_timing v41 found on top of
+the SP DMA losses for the MGC lists.
+
+These clocks are real clocks: timingAdd() takes them apart from the
+calibrated list prices.
+---
+ ares/n64/rdp/rdp.hpp    | 13 ++++++++++++-
+ ares/n64/rdp/timing.cpp | 28 +++++++++++++++++++++++-----
+ 2 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 77cf74de..469187e0 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -82,7 +82,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto viModeFactor() -> f64;
+   auto contendScale() -> f64;
+   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
+-  auto timingAdd(f64 cycles) -> void;
++  auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
++  auto timingPlacement(s32 row) -> f64;
+   auto timingDelay(f64 cycles) -> void;
+ 
+   //serialization.cpp
+@@ -100,6 +101,16 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //register fixed, this factor leaves every replayed list where it was against the console (rdp_timing v29:
+     //+0.005% on average) and makes the time the RDP really takes agree with what the ROMs report.
+     f64    calibration = 0.9828;
++    //RDP clocks a primitive (triangle or rectangle) loses when its command words are read from the megabyte of
++    //RDRAM it draws into (rdp_timing v53, four game lists moved next to their colour / depth buffer and elsewhere):
++    //the colour buffer's megabyte 20951 clocks over 2206 primitives, 7946 / 911, 11631 / 909, 9134 / 1227 (9.5
++    //each overall); the depth buffer's megabyte 3715 over 368 primitives that use depth, 9838 / 866, 9690 / 1179
++    //(9.6), nothing for a list without depth; another megabyte: within 0.2k clocks of each other
++    f64    listColor = 9.5;
++    f64    listDepth = 9.6;
++    //the same when the VI shows a buffer in the megabyte of the command list: 11998 / 2206 and 4590 / 911 in the
++    //MGC demo's mode (AA mode 2: 5.3), 12971 / 909 and 4522 / 1227 in the games' 320x240 modes (AA mode 0: 8.2)
++    f64    listVi = 5.3, listViAA = 8.2;
+     //the other bus masters are charged as they happen (timingDelay) instead of a fixed factor
+     f64    contentionZ = 1.0;      //scale on read-modify-write spans (image read / depth) beyond the per-transfer charges below
+     f64    contentionPlain = 1.0;  //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index faabcaf7..a35a78be 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -75,9 +75,9 @@ auto RDP::timingReset() -> void {
+ }
+ 
+ //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
+-auto RDP::timingAdd(f64 cycles) -> void {
+-  if(!timing.enable || cycles <= 0.0) return;
+-  cycles *= timing.calibration;
++auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
++  if(!timing.enable || cycles + measured <= 0.0) return;
++  cycles = cycles * timing.calibration + measured;  //'measured' is in real clocks already
+   timing.frameCycles += (u64)cycles;
+   timing.accumulated += cycles * 3.0;
+   u64 work = (u64)timing.accumulated;
+@@ -277,6 +277,24 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+   return cost;
+ }
+ 
++//a primitive whose command words are read from the megabyte of RDRAM it then draws into costs more, as if that
++//megabyte's open row were lost once each way (rdp_timing v53: the same list read from the megabyte of its colour
++//buffer, of its depth buffer and from two others). The VI reading its picture from the megabyte of the command
++//list costs the command fetch in the same way. Where the RSP's output buffer is makes no other difference.
++auto RDP::timingPlacement(s32 row) -> f64 {
++  if(command.source) return 0.0;  //XBUS: the commands come from DMEM
++  u32 pixel = timing.colorSize == 3 ? 4 : timing.colorSize == 2 ? 2 : 1;
++  u32 width = timing.colorWidth + 1;
++  u32 y = row < 0 ? 0 : row;
++  u32 list = (u32)command.current >> 20;
++  bool depth = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate);
++  f64 clocks = 0.0;
++  if(list == (timing.colorAddress + y * width * pixel & 0xffffff) >> 20) clocks += timing.listColor;
++  if(depth && list == (timing.depthAddress + y * width * 2 & 0xffffff) >> 20) clocks += timing.listDepth;
++  if(vi.active() && list == (vi.io.dramAddress & 0xffffff) >> 20) clocks += vi.io.antialias < 2 ? timing.listViAA : timing.listVi;
++  return clocks;
++}
++
+ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer) -> void {
+   //edge coefficients: Y in 11.2 signed fixed point, X in 16.16 signed fixed point
+   auto s14 = [](u64 v) -> s32 { s32 r = v & 0x3fff; if(r & 0x2000) r -= 0x4000; return r; };
+@@ -398,7 +416,7 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     if(rowsAbove && !rowsInside) cycles = 16.0 + timing.rowAbove * rowsAbove + (timing.atomicPrim ? 43.0 : 0.0);
+     if(cycles < least) cycles = least;
+   }
+-  timingAdd(cycles);
++  timingAdd(cycles, timingPlacement(rowStart));
+ }
+ 
+ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
+@@ -415,7 +433,7 @@ auto RDP::timingRectangle(s32 x0, s32 y0, s32 x1, s32 y1, bool fill) -> void {
+     for(s32 row = py0; row < py1; row++) cycles += timingSpan(px0, row, width);
+   }
+   cycles += rdp_tm_prim_overhead((enum rdp_tm_mode)timing.mode, width ? width : 1);
+-  timingAdd(cycles);
++  timingAdd(cycles, timingPlacement(py0));
+ }
+ 
+ auto RDP::timingSyncFull() -> void {
+-- 
+2.43.0
+

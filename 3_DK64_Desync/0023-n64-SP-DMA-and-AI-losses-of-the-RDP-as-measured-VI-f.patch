@@ -1,0 +1,230 @@
+From 16d4e3dbc888dc12a4de2a121cc6d93b0faab063 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 15 Nov 2026 00:28:38 +0900
+Subject: [PATCH 23/32] n64: SP DMA and AI losses of the RDP as measured, VI
+ factor of AA mode 2 on the whole list (rdp_timing v52-v54)
+
+SP DMA. What a transfer costs the RDP is now what rdp_timing v52 measured
+with transfers started by the CPU beside four game lists: 3.5 clocks + 1.11
+per 8 bytes reading RDRAM, 2.4 + 1.07 writing it, and a little more for the
+first transfer after a pause (0.55 / 0.3 clocks per doubling beyond 38
+clocks). v53 and v54 show a microcode feeding the RDP through an output
+buffer costs it the same: 300 clocks per 1 KiB read + write (293 here), 81
+to 101 per 344 B read + write with a DP_END write after each (99 here), and
+no more wherever the buffer is. The 9 + 1.2 per 8 bytes used so far was 15
+to 25% more at the sizes F3DEX2 uses; it had been standing in for the
+terms below and for the placement costs of the previous patch.
+
+AI. Each sample the AI fetches from RDRAM while the RDP has work in flight
+costs it 2.7 clocks, 5.9 when the AI's buffer is in the megabyte of the
+colour buffer and 5.4 in that of the command list (rdp_timing v54: the AI
+playing at 22050 / 32000 / 44100 Hz beside the four lists).
+
+VI. In AA mode 2 (resample only; the MGC 2011 demo's 640x480 mode) the VI
+factor applies to the whole list instead of its spans and loads: the console
+takes 1.026 to 1.035 times as long with the VI on whatever the list consists
+of (rdp_timing v29 / v42 / v53), which spans and loads alone gave as 1.023
+to 1.026. The 320x240 modes (AA modes 0 / 1) stay as they are: 1.110 and
+1.1015 on the console for the BAR and DK64 lists, 1.108 and 1.1016 here.
+---
+ ares/n64/ai/ai.cpp             |  1 +
+ ares/n64/rdp/rdp.hpp           | 22 ++++++++++++----------
+ ares/n64/rdp/timing.cpp        | 21 +++++++++++++++++++--
+ ares/n64/rsp/dma.cpp           | 20 ++++++++++++++++++--
+ ares/n64/rsp/rsp.hpp           |  2 ++
+ ares/n64/rsp/serialization.cpp |  1 +
+ 6 files changed, 53 insertions(+), 14 deletions(-)
+
+diff --git a/ares/n64/ai/ai.cpp b/ares/n64/ai/ai.cpp
+index a3e60bc8..f91a2115 100644
+--- a/ares/n64/ai/ai.cpp
++++ b/ares/n64/ai/ai.cpp
+@@ -38,6 +38,7 @@ auto AI::sample() -> void {
+   if(io.dmaCount && io.dmaLength[0] && io.dmaEnable) {
+     io.dmaAddress[0].bit(13,23) += io.dmaAddressCarry;
+     auto data = rdram.ram.read<Word>(io.dmaAddress[0], RBusDevice::AI_DMA);
++    rdp.timingAudio(io.dmaAddress[0]);  //the RDP loses the bus for the fetch
+     dac.left  = (s16)(data >> 16) / 32768.0;
+     dac.right = (s16)(data >>  0) / 32768.0;
+ 
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 469187e0..3a2511b7 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -84,6 +84,7 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
+   auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
+   auto timingPlacement(s32 row) -> f64;
++  auto timingAudio(u32 address) -> void;
+   auto timingDelay(f64 cycles) -> void;
+ 
+   //serialization.cpp
+@@ -111,6 +112,9 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //the same when the VI shows a buffer in the megabyte of the command list: 11998 / 2206 and 4590 / 911 in the
+     //MGC demo's mode (AA mode 2: 5.3), 12971 / 909 and 4522 / 1227 in the games' 320x240 modes (AA mode 0: 8.2)
+     f64    listVi = 5.3, listViAA = 8.2;
++    //RDP clocks lost to each sample the AI fetches from RDRAM (rdp_timing v54: 28458 clocks over 10473 samples
++    //with the buffer in an unrelated megabyte, 27807 / 4706 in the colour buffer's, 25571 / 4706 in the command list's)
++    f64    audioSample = 2.7, audioSampleColor = 5.9, audioSampleList = 5.4;
+     //the other bus masters are charged as they happen (timingDelay) instead of a fixed factor
+     f64    contentionZ = 1.0;      //scale on read-modify-write spans (image read / depth) beyond the per-transfer charges below
+     f64    contentionPlain = 1.0;  //the same for write-only spans (plain 1/2-cycle, fill, copy) and TMEM loads
+@@ -131,16 +135,14 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    contendCpuI = 5.8;      //a CPU instruction cache line fill (32 bytes)
+     f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
+     f64    contendCpuU = 2.6;      //an uncached CPU write
+-    f64    contendDma = 1.2;       //per 8 bytes of SP DMA, plus contendDmaBase per transfer: the RDP only gets about 36 clocks of
+-                                   //bus between two back-to-back DMAs whatever their size (rsp_timing v19b: 8 B 6, 64 B 10, 512 B 76, 3.5 KiB 549)
+-    f64    contendDmaBase = 9.0;   //an isolated transfer costs a few clocks more than a back-to-back one: F3DEX2's 1164 DMAs per frame
+-                                   //(168 B list fetches, 344 B output flushes, vertex and matrix loads) cost the RDP 51 clocks each with the VI
+-                                   //off (task_timing v20b: 0.057 VI per frame; the v19b rule gives 45, this 48) and 47-71 in the game's VI mode
+-                                   //depending on the console (PAL/NTSC); the contendScale factor (x1.28) sits between the two.
+-                                   //Transfers the CPU starts beside a replayed list cost less (rdp_timing v52: reads 3.5 + 1.11 per
+-                                   //8 bytes, writes 2.4 + 1.07, slightly more after a pause; v42: 9.2 at 64 B, 72 at 512 B), but a
+-                                   //microcode feeding the RDP through an output buffer costs it what these two give or more (v41:
+-                                   //343-384 clocks per 1 KiB read + write, 347-369 here), so they stay until the two are told apart
++    //RDP clocks lost to an SP DMA (rdp_timing v52; the CPU starts transfers of 64 B to 1 KiB beside four game lists):
++    //reading RDRAM 12.2 / 28.5 / 50.6 / 74.3 / 150 for 64 / 168 / 344 / 512 / 1024 B back to back, writing it
++    //11.2 / 25.5 / 48.7 / 71.5 / 143; after a pause the first costs more (168 B read: 28.3, 29.6, 30, 31.5, 32.5 after
++    //0 / 100 / 400 / 1600 / 6400 clocks; 344 B write: 47.7 to 52). A microcode feeding the RDP 1 KiB at a time costs
++    //it the same (v53: 300 per 1 KiB read + write back to back, 249 to 299 spread over the list; v54: 81 to 101 per
++    //344 B read + write with a DP_END write each, 99 here). Up to series v17 this was 9 + 1.2 per 8 bytes.
++    f64    contendDmaRead = 3.5, contendDmaReadUnit = 1.11, contendDmaReadGap = 0.55;     //per transfer, per 8 bytes, per doubling of the pause beyond 38 clocks
++    f64    contendDmaWrite = 2.4, contendDmaWriteUnit = 1.07, contendDmaWriteGap = 0.3;
+     f64    spanPenalty = 15.0;     //extra clocks per read-modify-write span of a primitive placed anywhere but right after the previous one (rdp_timing v9: the game lists need 15 on top of the stacked-primitive tables)
+     f64    zPassFraction = 0.75;   //share of depth-tested pixels that pass (estimated from overdraw when zPassAuto)
+     bool   zPassAuto = true;
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index a35a78be..bc2a0e39 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -57,7 +57,8 @@ auto RDP::timingReset() -> void {
+   timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+   timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
+-  timing.contendDma = t.contendDma; timing.contendDmaBase = t.contendDmaBase;
++  timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
++  timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
+   timing.zPassFraction = t.zPassFraction;
+   timing.zPassAuto = t.zPassAuto; timing.zFailWidth = t.zFailWidth;
+   timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
+@@ -74,9 +75,24 @@ auto RDP::timingReset() -> void {
+   timingMode();
+ }
+ 
++//the AI fetched a sample from RDRAM while the RDP has work in flight (rdp_timing v54: the AI playing at 22050 /
++//32000 / 44100 Hz beside four game lists costs the RDP 2.7 clocks per sample, 5.9 when its buffer is in the megabyte
++//of the colour buffer and 5.4 in that of the command list)
++auto RDP::timingAudio(u32 address) -> void {
++  u32 megabyte = (address & 0xffffff) >> 20;
++  f64 clocks = timing.audioSample;
++  if(megabyte == (timing.colorAddress & 0xffffff) >> 20) clocks = timing.audioSampleColor;
++  else if(!command.source && megabyte == (u32)command.current >> 20) clocks = timing.audioSampleList;
++  timingDelay(clocks);
++}
++
+ //queue 'cycles' RDP clocks of work (3 system clocks per RDP clock)
+ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+   if(!timing.enable || cycles + measured <= 0.0) return;
++  //in AA mode 2 (resample only, the MGC demo's) the VI slows the whole list, not only its spans and loads: the console's
++  //lists take 1.026 to 1.035 times as long with the VI on whatever they consist of (rdp_timing v29 / v42 / v53; the
++  //factor on spans and loads alone gave 1.023 to 1.026, least for the lists of small triangles)
++  if(vi.io.antialias == 2) cycles *= viModeFactor();
+   cycles = cycles * timing.calibration + measured;  //'measured' is in real clocks already
+   timing.frameCycles += (u64)cycles;
+   timing.accumulated += cycles * 3.0;
+@@ -151,7 +167,8 @@ auto RDP::viModeFactor() -> f64 {
+ //what a span or load costs in a running game relative to the idle-console tables
+ auto RDP::timingScale(bool memoryBound) -> f64 {
+   f64 f = memoryBound ? timing.contentionZ : timing.contentionPlain;
+-  return f * viModeFactor();
++  if(vi.io.antialias != 2) f *= viModeFactor();  //AA mode 2: on the whole list (timingAdd)
++  return f;
+ }
+ 
+ //what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (v12: x1.25 in the AA modes)
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 77abaa38..79dbf9fd 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -9,9 +9,24 @@ auto RSP::dmaStep(u32 clocks) -> void {
+     if(dma.clock >= 0) {
+       dmaTransferStep();
+     }
++  } else if(dma.idle < 1 << 24) {
++    dma.idle += clocks;
+   }
+ }
+ 
++//what one row of a transfer costs the RDP while it has work in flight (rdp_timing v52: transfers started by the CPU
++//beside four game lists, by direction, length and spacing; v53: the same when a microcode feeds the RDP through its
++//output buffer, 300 clocks per 1 KiB read + write against 293 here; v54: 344 B at a time with a DP_END write after
++//each, 81 to 101 against 99). 'start' is the first row of a transfer.
++auto RSP::dmaContention(bool start) -> f64 {
++  auto& t = rdp.timing;
++  u32 units = (dma.current.length + 8) / 8;
++  f64 clocks = dma.busy.read ? t.contendDmaRead + units * t.contendDmaReadUnit : t.contendDmaWrite + units * t.contendDmaWriteUnit;
++  u32 gap = dma.idle / 3;  //RDP clocks since the previous transfer ended
++  if(start && gap >= 38) clocks += (dma.busy.read ? t.contendDmaReadGap : t.contendDmaWriteGap) * log2((f64)(gap > 8192 ? 8192 : gap) / 38.0);
++  return clocks * rdp.contendScale();
++}
++
+ auto RSP::dmaTransferStart(Thread& thread) -> void {
+   if(dma.busy.any()) return;
+   if(dma.full.any()) {
+@@ -19,7 +34,7 @@ auto RSP::dmaTransferStart(Thread& thread) -> void {
+     dma.busy    = dma.full;
+     dma.full    = {0,0};
+     dmaQueue(dmaClocks(dma.current.length) + (dma.busy.read ? DmaClocksPerTransfer : DmaClocksPerWrite), thread);
+-    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());  //the RDP loses the bus meanwhile
++    rdp.timingDelay(dmaContention(true));  //the RDP loses the bus meanwhile
+   }
+ }
+ 
+@@ -67,9 +82,10 @@ auto RSP::dmaTransferStep() -> void {
+     dma.current.count -= 1;
+     dma.current.dramAddress += dma.current.skip;
+     dmaQueue(dmaClocks(dma.current.length), *this);
+-    rdp.timingDelay((rdp.timing.contendDmaBase + (dma.current.length+8) / 8 * rdp.timing.contendDma) * rdp.contendScale());
++    rdp.timingDelay(dmaContention(false));
+   } else {
+     dma.busy = {0,0};
++    dma.idle = 0;
+     dma.current.length = 0xFF8;
+     dmaTransferStart(*this);
+   }
+diff --git a/ares/n64/rsp/rsp.hpp b/ares/n64/rsp/rsp.hpp
+index 1eec719f..3a0e0c5f 100644
+--- a/ares/n64/rsp/rsp.hpp
++++ b/ares/n64/rsp/rsp.hpp
+@@ -276,6 +276,7 @@ struct RSP : Thread, Memory::RCP<RSP> {
+   enum : u32 { DmaCpuPenaltyClocks = 54, DmaCpuStallCycles = 19 };  //54 system clocks = 18 RCP clocks
+   auto dmaQueue(u32 clocks, Thread& thread) -> void;
+   auto dmaStep(u32 clocks) -> void;
++  auto dmaContention(bool start) -> f64;
+   auto dmaTransferStart(Thread& thread) -> void;
+   auto dmaTransferStep() -> void;
+ 
+@@ -310,6 +311,7 @@ struct RSP : Thread, Memory::RCP<RSP> {
+     } busy, full;
+ 
+     s64 clock;
++    u32 idle;  //system clocks since the last transfer ended
+   } dma;
+ 
+   struct Status : Memory::RCP<Status> {
+diff --git a/ares/n64/rsp/serialization.cpp b/ares/n64/rsp/serialization.cpp
+index d8ad6f41..b6da43c2 100644
+--- a/ares/n64/rsp/serialization.cpp
++++ b/ares/n64/rsp/serialization.cpp
+@@ -24,6 +24,7 @@ auto RSP::serialize(serializer& s) -> void {
+   s(dma.full.read);
+   s(dma.full.write);
+   s(dma.clock);
++  s(dma.idle);
+ 
+   s(status.semaphore);
+   s(status.halted);
+-- 
+2.43.0
+

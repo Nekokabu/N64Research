@@ -1,7 +1,7 @@
-From 1d6ded68fbf892080d7c4333d16c6c8b854c354d Mon Sep 17 00:00:00 2001
+From 10330e749347a309789902cd353635e18a8ec892 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 08:29:00 +0900
-Subject: [PATCH 09/12] n64: SP DMA slowed by the VI and by CPU line transfers;
+Subject: [PATCH 09/32] n64: SP DMA slowed by the VI and by CPU line transfers;
  the RDP only gets 36 clocks between DMAs (rsp_timing v19/v19b)
 
 rsp_timing v19 ran the v16 DMA kernels beside a drawing RDP, the VI in a 320x240
@@ -19,9 +19,6 @@ whole DMA minus that gap (8 B: 6, 64 B: 10, 512 B: 76, 3.5 KiB: 549 clocks; a 28
 fill list takes 16x as long beside continuous 3.5 KiB DMAs). The per-8-byte loss was
 right (1.22) but each transfer costs 6 more, and the DMA's own byte rate is 0.15 RSP
 cycles per byte (3.6 system clocks per 8 bytes), not 0.167.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/cpu/cpu.cpp    |  4 ++++
  ares/n64/rdp/rdp.hpp    |  3 ++-

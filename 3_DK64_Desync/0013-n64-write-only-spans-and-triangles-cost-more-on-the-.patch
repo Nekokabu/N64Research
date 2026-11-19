@@ -1,8 +1,8 @@
-From 16923da337551d0260b3e2173cf7e10aa5695bed Mon Sep 17 00:00:00 2001
+From 04dac98679a821ce1f0d6c9102b5b81f33e3672a Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Tue, 3 Nov 2026 00:13:50 +0900
-Subject: [PATCH] n64: write-only spans and triangles cost more on the console
- (rdp_timing v29-v32, MGC 2011)
+Subject: [PATCH 13/32] n64: write-only spans and triangles cost more on the
+ console (rdp_timing v29-v32, MGC 2011)
 
 The MGC 2011 demo (Retroactive) advances by rendered frames while its music
 plays in real time, so a part that renders faster than on the console runs

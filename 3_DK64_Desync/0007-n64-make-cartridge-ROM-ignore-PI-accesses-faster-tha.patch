@@ -1,7 +1,7 @@
-From 0ee7d240cb1b3a2ec89d7d9f3d358d8f9a5f0582 Mon Sep 17 00:00:00 2001
+From ce3978a0c090e6ce2b48e92f4036ae8371d83e32 Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Mon, 12 Oct 2026 00:48:19 +0900
-Subject: [PATCH 07/12] n64: make cartridge ROM ignore PI accesses faster than
+Subject: [PATCH 07/32] n64: make cartridge ROM ignore PI accesses faster than
  a mask ROM can serve
 
 The PI bus timing registers (PI_BSD_DOM1_LAT/PWD) were accepted
@@ -31,9 +31,6 @@ rejected.
 Verified with a headless run of the ROM: before the change the fail flag
 at 0x8001F8D0 is set and "FAIL." is drawn; after it the flag stays clear
 and the demo plays through its scenes.
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01XM2ynbCHjj8s9JtNp3P6Zx
 ---
  ares/n64/cartridge/cartridge.hpp | 29 ++++++++++++++++++++++++++++-
  ares/n64/pi/device.hpp           | 14 ++++++++++++++

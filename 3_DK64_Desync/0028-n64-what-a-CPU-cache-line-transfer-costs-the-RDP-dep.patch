@@ -1,0 +1,276 @@
+From 31c964913e11b984923974c6d3da841646d5b322 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Mon, 16 Nov 2026 22:23:50 +0900
+Subject: [PATCH 28/32] n64: what a CPU cache line transfer costs the RDP
+ depends on where in RDRAM it is (rdp_timing v58 / v59)
+
+Until now a CPU data cache fill cost the RDP 10.4 clocks and an
+instruction cache fill 5.8, wherever they were. Those are the values of
+where rdp_timing v42 happened to measure: the data loads in the megabyte
+of the command list, the instruction load in a megabyte the RDP did not
+use. rdp_timing v58 showed that the place decides (an instruction fill in
+the megabyte of a colour buffer that is read and written costs 3 to 5
+clocks more), and v59 measured it beside four game lists on an NTSC
+console, VI off and in each title's VI mode (the VI confirmed running),
+with the loads in a megabyte the list does not use, in the megabyte of
+the command list, of the colour buffer, of the depth buffer, and with the
+VI showing the load's megabyte:
+
+                         data fill     instruction fill   random store
+  unused megabyte        8.1 to 10.8   5.0 to 6.8         11.6 to 14.0
+  the list's megabyte    +0.3 to 0.7   +0.3 to 0.9        +0.3 to 0.9
+  the colour buffer's    +2.3 to 2.7   +4.3 to 7.0        +2.9 to 6.2
+  the depth buffer's     +1.3 / 1.7    +3.1 / 3.7         +2.9 / 4.4   (lists that use depth)
+  the VI's picture       +0.7          +1.8               +0.9         (AA 0/1, in that mode's clocks)
+                         +0.4          +0.85              +0.6         (the MGC demo's AA 2)
+
+In the games the places differ a lot: 86% of the instruction fills and
+64% of the data fills of the Beetle Adventure Racing intro are in the
+megabyte of its command FIFO (code and FIFO share megabyte 0), 15% / 7% in
+the colour buffer's megabyte and 17% / 6% in the one the VI shows, while
+80% or more of DK64's and the MGC demo's fills are in megabytes the RDP
+does not use.
+
+RDP::timingCpu() takes the kind of transfer and its RDRAM address (for
+the recompiler's instruction fill, the program counter) and adds the term
+of its place to the base value of an unused megabyte (9.95 / 6.1; the
+write-back keeps 5.0). The instruction fill no longer has a VI scale of
+its own: with the VI showing another megabyte it grows like the data
+transfers (x1.33 to 1.38 at 320x240, x1.10 to 1.14 in the MGC demo's
+mode); the x1.56 of patch 0025 was the VI showing the megabyte of the
+test's own code.
+
+Results in the test harness (series v23 against v22): BAR intro 236 / 316
+frames in the two segments (was 246 / 320; console 231 / 325); in the
+first segment every 60 VI block is now within one frame of the console.
+DK64 title demo frame deltas 2 / 3 / 4+ = 7 / 371 / 42, 46 frames
+differing from the console (was 5 / 376 / 40, 56; console 9 / 385-391 /
+25). MGC 2011 demo parts 1 to 5 -0.1 / +0.6 / +0.4 / -0.1 / +1.5%, the "@"
+frame at VI 9417 (was 9426; console 9385). What is left depends on the
+list: beside DK64's list d6373 every transfer costs about 0.8 times what
+it costs beside the others, which the model does not have yet.
+---
+ ares/n64/cpu/cpu.cpp    | 17 ++++++++++-------
+ ares/n64/cpu/cpu.hpp    |  7 ++++---
+ ares/n64/cpu/dcache.cpp |  3 ++-
+ ares/n64/rdp/rdp.hpp    | 22 +++++++++++++++++-----
+ ares/n64/rdp/timing.cpp | 23 +++++++++++++++++++----
+ 5 files changed, 52 insertions(+), 20 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index 868ffaed..a652a31c 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -193,7 +193,7 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+   icache.line(vaddr).fill(paddr, *this);
+ }
+ 
+-auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind) -> u32 {
++auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind, u32 address) -> u32 {
+   u32 total = 0;
+   if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
+   if(rdp.timing.enable && rsp.dma.busy.any()) {  //an SP DMA in flight: the two transfers delay each other (rsp_timing v19)
+@@ -201,7 +201,7 @@ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind) -> u32 {
+     total += RSP::DmaCpuStallCycles;
+   }
+   if(rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze) {
+-    rdp.timingDelay(rdpClocks * rdp.contendScale(kind));  //and the RDP loses the bus for the transfer
++    rdp.timingDelay(rdp.timingCpu(kind, rdpClocks, address));  //and the RDP loses the bus for the transfer
+     total += cycles;
+   }
+   return total;
+@@ -252,9 +252,9 @@ auto CPU::hazardCycles(u32 instruction, u32 next) -> u32 {
+   return cycles;
+ }
+ 
+-auto CPU::icacheBusyStall() -> u32 {
++auto CPU::icacheBusyStall(u32 paddr) -> u32 {
+   viStallCycles = ViStallIFill;
+-  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::ContendCpuI);
++  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::CpuInstructionFill, paddr);
+   viStallCycles = ViStallFill;
+   return r;
+ }
+@@ -265,7 +265,7 @@ auto CPU::postWriteBack() -> void {
+   wbPending = false;
+   viStallCycles = ViStallWriteBack;
+   s64 now = busNow();
+-  busFreeAt = (busFreeAt > now ? busFreeAt : now) + (DCacheWriteBackCycles + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW)) * 2;
++  busFreeAt = (busFreeAt > now ? busFreeAt : now) + (DCacheWriteBackCycles + rdpBusyStall(DCacheWriteBackStall, rdp.timing.contendCpuW, RDP::CpuWriteBack, wbAddress)) * 2;
+   viStallCycles = ViStallFill;
+ }
+ 
+@@ -279,7 +279,7 @@ auto CPU::postWrite(u32 paddr) -> void {
+     wbHead = wbHead + 1 & 3; wbCount--;
+   }
+   u32 cycles;
+-  if(paddr < 0x03f0'0000) cycles = UncachedWriteCycles + rdpBusyStall(UncachedWriteStall, rdp.timing.contendCpuU);
++  if(paddr < 0x03f0'0000) cycles = UncachedWriteCycles + rdpBusyStall(UncachedWriteStall, rdp.timing.contendCpuU, RDP::CpuUncachedWrite);
+   else if((paddr & 0xfff0'0000) == 0x0430'0000) cycles = MiWriteCycles;
+   else cycles = RcpWriteCycles;
+   s64 start = busFreeAt > now ? busFreeAt : now;
+@@ -291,7 +291,10 @@ auto CPU::postWrite(u32 paddr) -> void {
+ //the recompiler's inline instruction cache fill: the stall part of the fill time
+ auto CPU::icacheStall() -> void {
+   busWaitFill();
+-  if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::ContendCpuI)) step(cycles * 2);
++  //the fill is at the program counter; a mapped address (not kseg0 / kseg1) is taken as unknown
++  u32 pc = (u32)ipu.pc;
++  u32 address = pc >= 0x8000'0000 && pc < 0xc000'0000 ? pc & 0x1fff'ffff : ~0u;
++  if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::CpuInstructionFill, address)) step(cycles * 2);
+ }
+ 
+ template<bool Recompiled>
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index 9a0adb5e..06add39f 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -59,9 +59,9 @@ struct CPU : Thread {
+   //rdp_timing test ROMs (v8/v10/v12): under a drawing RDP an instruction cache fill takes 6 CPU
+   //cycles longer, a data cache fill 5, a data cache write-back 11; in the games' VI mode another
+   //6/6/2. Each transfer in turn costs the RDP some clocks (rdp.timing.contendCpu*).
+-  auto rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind = 1) -> u32;  //kind: RDP::ContendCpu / ContendCpuI
++  auto rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind, u32 address = ~0u) -> u32;  //kind: RDP::CpuDataFill ...; address: RDRAM address, ~0 = unknown
+   auto icacheStall() -> void;
+-  auto icacheBusyStall() -> u32;
++  auto icacheBusyStall(u32 paddr) -> u32;
+   enum : u32 { ICacheFillStall = 6, DCacheFillStall = 5, DCacheWriteBackStall = 11 };
+   enum : u32 { ICacheFillCycles = 48, DCacheFillCycles = 40, DCacheWriteBackCycles = 25 };  //cpu_timing v14: fill 41 incl. the load, write-back 25
+   enum : u32 { ViStallFill = 6, ViStallIFill = 6, ViStallWriteBack = 2 };
+@@ -81,6 +81,7 @@ struct CPU : Thread {
+   s64 clockEpoch = 0;          //Thread::clock is reset at every synchronize(); epoch + clock is monotonic
+   s64 busFreeAt = 0;           //when the last posted write leaves the bus
+   s64 wbDone[WriteBufferEntries] = {}; u32 wbHead = 0, wbCount = 0;
++  u32  wbAddress = ~0u;        //RDRAM address of the line waiting in the write buffer
+   bool wbPending = false;      //a dirty line waits to be written back after the fill that evicted it
+   auto busNow() const -> s64 { return clockEpoch + Thread::clock; }
+   auto busWait() -> void { s64 now = busNow(); if(busFreeAt > now) step((u32)(busFreeAt - now)); wbCount = 0; }
+@@ -261,7 +262,7 @@ struct CPU : Thread {
+ 
+       auto fill(u32 paddr, CPU& cpu) -> void {
+         cpu.busWaitFill();
+-        cpu.step((ICacheFillCycles + cpu.icacheBusyStall()) * 2);
++        cpu.step((ICacheFillCycles + cpu.icacheBusyStall(paddr)) * 2);
+         const u32 tag = paddr & ~0x0000'0fffu;
+         tagKey = tag;
+         setValid(true);
+diff --git a/ares/n64/cpu/dcache.cpp b/ares/n64/cpu/dcache.cpp
+index bd552f9d..32cf800e 100644
+--- a/ares/n64/cpu/dcache.cpp
++++ b/ares/n64/cpu/dcache.cpp
+@@ -5,7 +5,7 @@ auto CPU::DataCache::Line::hit(u32 paddr) const -> bool {
+ 
+ auto CPU::DataCache::Line::fill(u32 paddr) -> void {
+   cpu.busWaitFill();
+-  cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu)) * 2);
++  cpu.step((CPU::DCacheFillCycles + cpu.rdpBusyStall(CPU::DCacheFillStall, rdp.timing.contendCpu, RDP::CpuDataFill, paddr)) * 2);
+   //the line evicted by this fill is written from the write buffer after the fill; the bus stays busy
+   if(cpu.wbPending) cpu.postWriteBack();
+   const u32 tag = paddr & ~0x0000'0fffu;
+@@ -20,6 +20,7 @@ auto CPU::DataCache::Line::writeBack() -> void {
+   cpu.step(CPU::WriteBufferCycles * 2);
+   cpu.wbPending = true;
+   const u32 tag = tagKey & ~0x0000'0fffu;
++  cpu.wbAddress = tag | index;
+   cpu.busWriteBurst<DCache>(tag | index, words);
+ }
+ 
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 3412b072..140739bf 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -80,8 +80,10 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingMode() -> u32;
+   auto timingScale(bool memoryBound) -> f64;
+   auto viModeFactor() -> f64;
+-  enum : u32 { ContendDma, ContendCpu, ContendCpuI };  //who took the bus: an SP DMA, a CPU data transfer, a CPU instruction cache fill
++  enum : u32 { ContendDma, ContendCpu };  //who took the bus: an SP DMA, a CPU transfer
+   auto contendScale(u32 kind) -> f64;
++  enum : u32 { CpuDataFill, CpuInstructionFill, CpuWriteBack, CpuUncachedWrite };
++  auto timingCpu(u32 kind, f64 clocks, u32 address) -> f64;
+   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
+   auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
+   auto timingPlacement(s32 row) -> f64;
+@@ -141,17 +143,27 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    dmaVi = 3.0, dmaViWrite = 1.9, dmaViUnit = 0.063, dmaViGap = 3.0, dmaViGapWrite = 1.9;
+     f64    dmaViAA2 = 1.5, dmaViUnitAA2 = 0.023, dmaViGapAA2 = 1.1;
+     f64    viContendDma = 1.94, viContendDmaAA2 = 3.2;
+-    f64    viContendCpu = 2.75, viContendCpuAA2 = 4.2;
+-    f64    viContendCpuI = 4.83, viContendCpuIAA2 = 10.3;
++    f64    viContendCpu = 2.75, viContendCpuAA2 = 4.2;  //instruction fills as well: x1.33 to 1.38 / x1.10 to 1.14 with the VI showing another megabyte (rdp_timing v59)
+     //RDP clocks lost to each transfer of another bus master while it has work in flight (real clocks, not scaled by
+     //'calibration'). The CPU's four are rdp_timing v42 (the CPU loading the bus beside nine replayed game lists, VI off)
+     //read again with the fixed DPC_CLOCK: the console loses 10.39 clocks per dependent data cache fill, 6.38 per
+     //instruction cache fill, 13.63 per random store (a fill and a write-back), 23.56 per iteration of the mixed loop
+     //and 2.58 per uncached write; these values give 10.46 / 6.27 / 13.53 / 23.24 / 2.62
+-    f64    contendCpu = 10.4;      //a CPU data cache line fill (16 bytes): also 10.4 with the VI off under a real task (task_timing v20b)
+-    f64    contendCpuI = 5.8;      //a CPU instruction cache line fill (32 bytes)
++    //rdp_timing v59: the CPU's transfers beside four game lists, each in a megabyte the list does not use, in the
++    //megabyte of the command list, of the colour buffer and of the depth buffer (v42 had measured data fills in the
++    //list's megabyte and instruction fills in an unused one). In an unused megabyte, VI off:
++    f64    contendCpu = 9.95;      //a CPU data cache line fill (16 bytes): 8.1 to 10.8 (v42's ten lists: 10.4 in the list's megabyte)
++    f64    contendCpuI = 6.1;      //a CPU instruction cache line fill (32 bytes): 5.0 to 6.8
+     f64    contendCpuW = 5.0;      //a CPU data cache write-back (16 bytes)
+     f64    contendCpuU = 2.6;      //an uncached CPU write
++    //added by where the transfer is, for a data fill / an instruction fill / a write-back: the megabyte of the command
++    //list (+0.3 to 0.9), of the colour buffer (data +2.3 to 2.7, instruction +4.3 to 7.0, a random store +2.9 to 6.2),
++    //of the depth buffer of a list that uses depth (+1.3 / 1.7, +3.1 / 3.7, a store +2.9 / 4.4); and, in clocks of that
++    //VI mode, the megabyte the VI shows (AA 0/1: +0.7, +1.8, a store +0.9; the MGC demo's AA 2: +0.4, +0.85, +0.6)
++    f64    cpuList[3]  = {0.45, 0.5, 0.0};
++    f64    cpuColor[3] = {2.4, 5.8, 1.9};
++    f64    cpuDepth[3] = {1.5, 3.4, 2.15};
++    f64    cpuVi[3]    = {0.72, 1.8, 0.2}, cpuViAA2[3] = {0.38, 0.85, 0.2};
+     //RDP clocks lost to an SP DMA (rdp_timing v52; the CPU starts transfers of 64 B to 1 KiB beside four game lists):
+     //reading RDRAM 12.2 / 28.5 / 50.6 / 74.3 / 150 for 64 / 168 / 344 / 512 / 1024 B back to back, writing it
+     //11.2 / 25.5 / 48.7 / 71.5 / 143; after a pause the first costs more (168 B read: 28.3, 29.6, 30, 31.5, 32.5 after
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 5c20ed04..73571fc4 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -60,7 +60,10 @@ auto RDP::timingReset() -> void {
+   timing.viContendDma = t.viContendDma; timing.viContendDmaAA2 = t.viContendDmaAA2; timing.viContendCpu = t.viContendCpu; timing.viContendCpuAA2 = t.viContendCpuAA2;
+   timing.rspBeside = t.rspBeside; timing.rspBesideVi = t.rspBesideVi; timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViWrite = t.dmaViWrite; timing.dmaViUnit = t.dmaViUnit;
+   timing.dmaViGap = t.dmaViGap; timing.dmaViGapWrite = t.dmaViGapWrite; timing.dmaViAA2 = t.dmaViAA2; timing.dmaViUnitAA2 = t.dmaViUnitAA2; timing.dmaViGapAA2 = t.dmaViGapAA2;
+-  timing.viContendCpuI = t.viContendCpuI; timing.viContendCpuIAA2 = t.viContendCpuIAA2;
++  for(u32 n : range(3)) {
++    timing.cpuList[n] = t.cpuList[n]; timing.cpuColor[n] = t.cpuColor[n]; timing.cpuDepth[n] = t.cpuDepth[n];
++    timing.cpuVi[n] = t.cpuVi[n]; timing.cpuViAA2[n] = t.cpuViAA2[n];
++  }
+   timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
+   timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
+   timing.zPassFraction = t.zPassFraction;
+@@ -106,6 +109,20 @@ auto RDP::timingAdd(f64 cycles, f64 measured) -> void {
+   timing.pending += work;
+ }
+ 
++//what a CPU transfer costs the RDP: 'clocks' in a megabyte the RDP does not use with the VI off, more where the
++//RDP or the VI works (rdp_timing v59). 'address' is the RDRAM address of the transfer, ~0 when it is not known.
++auto RDP::timingCpu(u32 kind, f64 clocks, u32 address) -> f64 {
++  f64 extra = 0.0;
++  if(kind < CpuUncachedWrite && address < 0x0080'0000) {
++    u32 megabyte = address >> 20;
++    if(megabyte == (timing.colorAddress & 0xffffff) >> 20) clocks += timing.cpuColor[kind];
++    else if((timing.depthSeen || timing.depthLast) && megabyte == (timing.depthAddress & 0xffffff) >> 20) clocks += timing.cpuDepth[kind];
++    else if(!command.source && megabyte == (u32)command.current >> 20) clocks += timing.cpuList[kind];
++    if(vi.active() && megabyte == ((u32)vi.io.dramAddress & 0xffffff) >> 20) extra = vi.io.antialias < 2 ? timing.cpuVi[kind] : timing.cpuViAA2[kind];
++  }
++  return clocks * contendScale(ContendCpu) + extra;
++}
++
+ //another bus master held RDRAM for 'cycles' RDP clocks while the RDP had work in flight:
+ //everything queued, including the Sync_Full interrupts already waiting, completes that much later
+ //(real clocks: the losses in rdp.hpp are stated as measured, without the calibration of the list prices)
+@@ -178,9 +195,7 @@ auto RDP::timingScale(bool memoryBound) -> f64 {
+ //what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (rdp_timing v56)
+ auto RDP::contendScale(u32 kind) -> f64 {
+   bool aa2 = vi.io.antialias >= 2;  //no divot / dedither fetch
+-  f64 scale = kind == ContendDma  ? (aa2 ? timing.viContendDmaAA2  : timing.viContendDma)
+-            : kind == ContendCpuI ? (aa2 ? timing.viContendCpuIAA2 : timing.viContendCpuI)
+-            :                       (aa2 ? timing.viContendCpuAA2  : timing.viContendCpu);
++  f64 scale = kind == ContendDma ? (aa2 ? timing.viContendDmaAA2 : timing.viContendDma) : (aa2 ? timing.viContendCpuAA2 : timing.viContendCpu);
+   return 1.0 + (viModeFactor() - 1.0) * scale;
+ }
+ 
+-- 
+2.43.0
+

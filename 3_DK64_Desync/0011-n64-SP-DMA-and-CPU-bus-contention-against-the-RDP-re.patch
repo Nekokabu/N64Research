@@ -1,7 +1,7 @@
-From 97771eac1667ed1aca18be6e5a4a32808825821e Mon Sep 17 00:00:00 2001
+From f80019e3079e7a51cae95bc0f7362eb25097d28a Mon Sep 17 00:00:00 2001
 From: Nekokabu <nekokabu@gmail.com>
 Date: Sat, 31 Oct 2026 19:20:41 +0900
-Subject: [PATCH 11/12] n64: SP DMA and CPU bus contention against the RDP
+Subject: [PATCH 11/32] n64: SP DMA and CPU bus contention against the RDP
  refitted on a real graphics task (task_timing v20b)
 
 task_timing v20b replays Beetle Adventure Racing's F3DEX2 graphics tasks on the console three ways: as the
@@ -22,9 +22,6 @@ x1.19 to x1.28.
 
 Frame 2316 as the game runs it: RSP end 1.477 VI, RDP 1.557 (console 1.538 / 1.587; 1.463 / 1.535 before);
 under a CPU chase 2.274 (console 2.372; 2.333 before).
-
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01D2j2gacEm5JVB2iSqRm8zF
 ---
  ares/n64/rdp/rdp.hpp | 11 ++++++++---
  ares/n64/rsp/dma.cpp |  4 ++--

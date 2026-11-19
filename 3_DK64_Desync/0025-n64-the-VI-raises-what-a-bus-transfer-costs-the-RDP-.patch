@@ -1,0 +1,173 @@
+From 59f900aab154bf4c20fc4da1f9d388e9639d4a83 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sun, 15 Nov 2026 22:11:50 +0900
+Subject: [PATCH 25/32] n64: the VI raises what a bus transfer costs the RDP by
+ a different amount for each kind of transfer (rdp_timing v56)
+
+The loss of the RDP to a transfer of another bus master was scaled by one
+factor, 1 + (VI factor - 1) x 2.4: x1.28 in the 320x240 16-bit AA modes
+and x1.07 in the MGC demo's AA mode 2.
+
+rdp_timing v56 measured it on an NTSC console beside four game lists, with
+the VI off and in each title's mode, checking with a CPU-side probe that
+the VI was running (v55's rows for the 320x240 modes and v42's "title VI
+mode" rows had the VI stopped):
+
+                           320x240 AA 0/1        MGC demo, AA 2
+  SP DMA (168 B read,      x1.19 to 1.28 (1.23)  x1.07 to 1.14 (1.09)
+   344 B write, both)
+  CPU data cache fill,     x1.27 to 1.36 (1.32)  x1.10 to 1.16 (1.13)
+   random store
+  CPU instruction fill     x1.56 / 1.57          x1.24 / 1.38 (1.31)
+
+contendScale() now takes the kind of transfer; the six scales are the
+measured factors divided by the VI factor's excess (0.117 and 0.03).
+
+Results in the test harness (series v20 against v19): MGC 2011 demo, parts
+1 to 5 -0.1 / +0.1 / -0.0 / -0.6 / +1.2% (was -0.4 / -0.2 / -0.4 / -0.8 /
++1.0%), the "@" frame at VI 9382 (was 9356; console 9385). DK64 title demo
+frame deltas 2 / 3 / 4+ = 6 / 381 / 36 (was 11 / 370 / 38; console 9 /
+385-391 / 25). BAR intro 255 / 327 frames in the two segments (was 252 /
+331; console 231 / 325): the first segment does not improve, its real
+tasks lose more to the RSP under the VI than these isolated transfers
+explain (task_timing v21).
+---
+ ares/n64/cpu/cpu.cpp    |  8 ++++----
+ ares/n64/cpu/cpu.hpp    |  2 +-
+ ares/n64/rdp/rdp.hpp    | 13 ++++++++++---
+ ares/n64/rdp/timing.cpp | 14 ++++++++++----
+ ares/n64/rsp/dma.cpp    |  2 +-
+ 5 files changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/ares/n64/cpu/cpu.cpp b/ares/n64/cpu/cpu.cpp
+index cdec3a4c..868ffaed 100644
+--- a/ares/n64/cpu/cpu.cpp
++++ b/ares/n64/cpu/cpu.cpp
+@@ -193,7 +193,7 @@ auto CPU::icacheFillLine(u64 vaddr, u32 paddr) -> void {
+   icache.line(vaddr).fill(paddr, *this);
+ }
+ 
+-auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
++auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind) -> u32 {
+   u32 total = 0;
+   if(rdp.timing.enable && vi.active() && vi.io.antialias < 2) total += viStallCycles;  //the VI's three-line fetch
+   if(rdp.timing.enable && rsp.dma.busy.any()) {  //an SP DMA in flight: the two transfers delay each other (rsp_timing v19)
+@@ -201,7 +201,7 @@ auto CPU::rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32 {
+     total += RSP::DmaCpuStallCycles;
+   }
+   if(rdp.timing.enable && rdp.timing.pending && !rdp.command.freeze) {
+-    rdp.timingDelay(rdpClocks * rdp.contendScale());  //and the RDP loses the bus for the transfer
++    rdp.timingDelay(rdpClocks * rdp.contendScale(kind));  //and the RDP loses the bus for the transfer
+     total += cycles;
+   }
+   return total;
+@@ -254,7 +254,7 @@ auto CPU::hazardCycles(u32 instruction, u32 next) -> u32 {
+ 
+ auto CPU::icacheBusyStall() -> u32 {
+   viStallCycles = ViStallIFill;
+-  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI);
++  u32 r = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::ContendCpuI);
+   viStallCycles = ViStallFill;
+   return r;
+ }
+@@ -291,7 +291,7 @@ auto CPU::postWrite(u32 paddr) -> void {
+ //the recompiler's inline instruction cache fill: the stall part of the fill time
+ auto CPU::icacheStall() -> void {
+   busWaitFill();
+-  if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI)) step(cycles * 2);
++  if(u32 cycles = rdpBusyStall(ICacheFillStall, rdp.timing.contendCpuI, RDP::ContendCpuI)) step(cycles * 2);
+ }
+ 
+ template<bool Recompiled>
+diff --git a/ares/n64/cpu/cpu.hpp b/ares/n64/cpu/cpu.hpp
+index 22d7a0e4..9a0adb5e 100644
+--- a/ares/n64/cpu/cpu.hpp
++++ b/ares/n64/cpu/cpu.hpp
+@@ -59,7 +59,7 @@ struct CPU : Thread {
+   //rdp_timing test ROMs (v8/v10/v12): under a drawing RDP an instruction cache fill takes 6 CPU
+   //cycles longer, a data cache fill 5, a data cache write-back 11; in the games' VI mode another
+   //6/6/2. Each transfer in turn costs the RDP some clocks (rdp.timing.contendCpu*).
+-  auto rdpBusyStall(u32 cycles, f64 rdpClocks) -> u32;
++  auto rdpBusyStall(u32 cycles, f64 rdpClocks, u32 kind = 1) -> u32;  //kind: RDP::ContendCpu / ContendCpuI
+   auto icacheStall() -> void;
+   auto icacheBusyStall() -> u32;
+   enum : u32 { ICacheFillStall = 6, DCacheFillStall = 5, DCacheWriteBackStall = 11 };
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 02777194..109246bc 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -80,7 +80,8 @@ struct RDP : Thread, Memory::RCP<RDP> {
+   auto timingMode() -> u32;
+   auto timingScale(bool memoryBound) -> f64;
+   auto viModeFactor() -> f64;
+-  auto contendScale() -> f64;
++  enum : u32 { ContendDma, ContendCpu, ContendCpuI };  //who took the bus: an SP DMA, a CPU data transfer, a CPU instruction cache fill
++  auto contendScale(u32 kind) -> f64;
+   auto timingSpan(s32 x, s32 y, u32 pixels) -> f64;
+   auto timingAdd(f64 cycles, f64 measured = 0.0) -> void;
+   auto timingPlacement(s32 row) -> f64;
+@@ -124,8 +125,14 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //line) +11.7% at 320x16-bit, +32% at 640x16-bit; mode 2 does not grow with the line (1280 pixels: +3%)
+     f64    viFactorAA3 = 1.004, viFactorAA2 = 1.03, viFactorAA0 = 1.117;
+     f64    viWidthScale = 1.77;    //AA 0/1: the factor over 1 grows by this per 640 bytes of line above 640: (1.324-1)/(1.117-1) = 1 + 1.77*(1280/640-1)
+-    f64    viContendScale = 2.4;   //the per-transfer losses below grow with the VI factor: 1 + 0.117*2.4 at 320x16 AA0 (task_timing v20b: a
+-                                   //CPU line fill costs the RDP 10.4 clocks with the VI off and 13.3 in the game's VI mode; v12 x1.25, v17 x1.42)
++    //the per-transfer losses below grow with the VI factor, each kind of transfer by its own amount: loss x (1 + (factor - 1) x scale).
++    //rdp_timing v56 (SP DMA and CPU loads beside four game lists, VI off and in the title's mode, the VI checked to be
++    //running): at 320x240 16-bit AA 0/1 (factor 1.117) an SP DMA costs x1.19 to 1.28, a CPU data cache fill or store
++    //x1.27 to 1.36, a CPU instruction cache fill x1.56 / 1.57; in the MGC demo's AA mode 2 (factor 1.03) x1.07 to 1.14,
++    //x1.10 to 1.16, x1.24 / 1.38
++    f64    viContendDma = 1.94, viContendDmaAA2 = 3.2;
++    f64    viContendCpu = 2.75, viContendCpuAA2 = 4.2;
++    f64    viContendCpuI = 4.83, viContendCpuIAA2 = 10.3;
+     //RDP clocks lost to each transfer of another bus master while it has work in flight (real clocks, not scaled by
+     //'calibration'). The CPU's four are rdp_timing v42 (the CPU loading the bus beside nine replayed game lists, VI off)
+     //read again with the fixed DPC_CLOCK: the console loses 10.39 clocks per dependent data cache fill, 6.38 per
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index bc2a0e39..a2f5775d 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -56,7 +56,9 @@ auto RDP::timingReset() -> void {
+   timing.spanPenalty = t.spanPenalty;
+   timing.contendCpu = t.contendCpu; timing.contendCpuI = t.contendCpuI; timing.contendCpuW = t.contendCpuW; timing.contendCpuU = t.contendCpuU;
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+-  timing.viWidthScale = t.viWidthScale; timing.viContendScale = t.viContendScale;
++  timing.viWidthScale = t.viWidthScale;
++  timing.viContendDma = t.viContendDma; timing.viContendDmaAA2 = t.viContendDmaAA2; timing.viContendCpu = t.viContendCpu; timing.viContendCpuAA2 = t.viContendCpuAA2;
++  timing.viContendCpuI = t.viContendCpuI; timing.viContendCpuIAA2 = t.viContendCpuIAA2;
+   timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
+   timing.contendDmaWrite = t.contendDmaWrite; timing.contendDmaWriteUnit = t.contendDmaWriteUnit; timing.contendDmaWriteGap = t.contendDmaWriteGap;
+   timing.zPassFraction = t.zPassFraction;
+@@ -171,9 +173,13 @@ auto RDP::timingScale(bool memoryBound) -> f64 {
+   return f;
+ }
+ 
+-//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (v12: x1.25 in the AA modes)
+-auto RDP::contendScale() -> f64 {
+-  return 1.0 + (viModeFactor() - 1.0) * timing.viContendScale;
++//what a bus transfer of another master costs the RDP, scaled by the VI's own traffic (rdp_timing v56)
++auto RDP::contendScale(u32 kind) -> f64 {
++  bool aa2 = vi.io.antialias >= 2;  //no divot / dedither fetch
++  f64 scale = kind == ContendDma  ? (aa2 ? timing.viContendDmaAA2  : timing.viContendDma)
++            : kind == ContendCpuI ? (aa2 ? timing.viContendCpuIAA2 : timing.viContendCpuI)
++            :                       (aa2 ? timing.viContendCpuAA2  : timing.viContendCpu);
++  return 1.0 + (viModeFactor() - 1.0) * scale;
+ }
+ 
+ //cost of one span of 'pixels' pixels whose first pixel is at (x, y) of the color image
+diff --git a/ares/n64/rsp/dma.cpp b/ares/n64/rsp/dma.cpp
+index 79dbf9fd..7381a453 100644
+--- a/ares/n64/rsp/dma.cpp
++++ b/ares/n64/rsp/dma.cpp
+@@ -24,7 +24,7 @@ auto RSP::dmaContention(bool start) -> f64 {
+   f64 clocks = dma.busy.read ? t.contendDmaRead + units * t.contendDmaReadUnit : t.contendDmaWrite + units * t.contendDmaWriteUnit;
+   u32 gap = dma.idle / 3;  //RDP clocks since the previous transfer ended
+   if(start && gap >= 38) clocks += (dma.busy.read ? t.contendDmaReadGap : t.contendDmaWriteGap) * log2((f64)(gap > 8192 ? 8192 : gap) / 38.0);
+-  return clocks * rdp.contendScale();
++  return clocks * rdp.contendScale(RDP::ContendDma);
+ }
+ 
+ auto RSP::dmaTransferStart(Thread& thread) -> void {
+-- 
+2.43.0
+

@@ -1,0 +1,91 @@
+From 246cca4cec55baef29828ad005b9f3646c5ce497 Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Mon, 16 Nov 2026 21:18:01 +0900
+Subject: [PATCH 27/32] n64: the RSP running beside the RDP costs the RDP a
+ share of that time (task_timing v22 / v23)
+
+task_timing v22 repeated the SP DMA transfers of six real graphics tasks
+(Beetle Adventure Racing intro, F3DEX2) without the task, beside the RDP
+working through each task's finished list. On an NTSC console the transfers
+alone cost what the model says (console / ares 0.91 to 1.01, with the VI
+off and in the game's VI mode), but a microcode that only waits already
+slowed the RDP. task_timing v23 measured that by itself, with the VI
+confirmed running before every run: an empty loop, a loop reading
+DP_STATUS and a loop reading SP DMA_BUSY, each for as long as the task
+runs and without any transfer, cost the RDP the same
+
+  VI off                         0.74 to 0.90% of the time the RSP runs (0.82)
+  320x240 16-bit AA mode (BAR)   1.26 to 1.59% (1.43)
+
+so it is the RSP executing, not its register reads. RDP::main() now adds
+that share to the work in flight while the RSP is not halted. Between and
+beyond the two measured VI states the share is scaled with the VI
+factor's excess (x1.75 at 1.117); the MGC demo's AA mode 2 is therefore an
+extrapolation (0.98%).
+
+This is what was missing when a task waits for room in its 8 KiB output
+FIFO: the RSP then runs for the whole frame. task_timing v23, DP done
+with the game's FIFO in the game's VI mode: console 0.717 / 0.620 / 0.851 /
+1.603 / 1.609 / 0.902 VI, before 0.701 / 0.610 / 0.837 / 1.574 / 1.574 /
+0.901.
+
+Results in the test harness (series v22 against v21): BAR intro 246 / 320
+frames in the two segments (was 253 / 326; console 231 / 325). DK64 title
+demo frame deltas 2 / 3 / 4+ = 5 / 376 / 40, 56 frames differing from the
+console (was 8 / 381 / 33, 46; console 9 / 385-391 / 25). MGC 2011 demo
+parts 1 to 5 -0.1 / +0.7 / +0.5 / +0.1 / +1.5%, the "@" frame at VI 9426
+(was 9389; console 9385). DK64 and the MGC demo move away from the
+console: with this term in, something else they depend on is now visibly
+too dear (for DK64's kind of list a CPU cache fill costs the RDP 8.4
+clocks on the console against the model's 10.4, rdp_timing v56).
+---
+ ares/n64/rdp/rdp.cpp    | 2 ++
+ ares/n64/rdp/rdp.hpp    | 5 +++++
+ ares/n64/rdp/timing.cpp | 2 +-
+ 3 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/ares/n64/rdp/rdp.cpp b/ares/n64/rdp/rdp.cpp
+index 1f7b465c..9fd8dcb6 100644
+--- a/ares/n64/rdp/rdp.cpp
++++ b/ares/n64/rdp/rdp.cpp
+@@ -39,6 +39,8 @@ auto RDP::main() -> void {
+     u32 clocks = (u32)min<s64>(-Thread::clock, 1 << 24);
+     if(timing.pending && !command.freeze && !command.crashed) {
+       clocks = timingStep(clocks);
++      //the RSP running beside the RDP costs it a share of that time, whatever the RSP executes (task_timing v23)
++      if(!rsp.status.halted) timingDelay(clocks / 3.0 * timing.rspBeside * (1.0 + (viModeFactor() - 1.0) * timing.rspBesideVi));
+     }
+     step(clocks);
+     //DPC_CLOCK counts RCP clocks (3 system clocks). The steps above are bounded by the work in flight, so the
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index f439c7b6..3412b072 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -132,6 +132,11 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     //x1.10 to 1.16, x1.24 / 1.38
+     //an SP DMA whose RDRAM side is in the megabyte of the colour buffer / of the depth buffer (rdp_timing v57), and in
+     //the megabyte the VI shows (clocks in that VI mode: AA 0/1 = base + per 8 bytes + after a pause; AA 2/3 likewise)
++    //the RSP executing beside the RDP costs it time, whatever the RSP does (task_timing v22 / v23: a microcode that only
++    //loops, with or without reading a DP or SP register, beside the RDP working through a finished list): 0.74 to 0.90%
++    //of the time both run with the VI off, 1.26 to 1.59% in the 320x240 AA mode of BAR (VI factor 1.117); other VI
++    //modes are scaled with the VI factor's excess (not measured)
++    f64    rspBeside = 0.0082, rspBesideVi = 6.4;
+     f64    dmaColor = 4.7, dmaDepth = 4.3;
+     f64    dmaVi = 3.0, dmaViWrite = 1.9, dmaViUnit = 0.063, dmaViGap = 3.0, dmaViGapWrite = 1.9;
+     f64    dmaViAA2 = 1.5, dmaViUnitAA2 = 0.023, dmaViGapAA2 = 1.1;
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 2b53a8ee..5c20ed04 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -58,7 +58,7 @@ auto RDP::timingReset() -> void {
+   timing.viFactorAA3 = t.viFactorAA3; timing.viFactorAA2 = t.viFactorAA2; timing.viFactorAA0 = t.viFactorAA0;
+   timing.viWidthScale = t.viWidthScale;
+   timing.viContendDma = t.viContendDma; timing.viContendDmaAA2 = t.viContendDmaAA2; timing.viContendCpu = t.viContendCpu; timing.viContendCpuAA2 = t.viContendCpuAA2;
+-  timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViWrite = t.dmaViWrite; timing.dmaViUnit = t.dmaViUnit;
++  timing.rspBeside = t.rspBeside; timing.rspBesideVi = t.rspBesideVi; timing.dmaColor = t.dmaColor; timing.dmaDepth = t.dmaDepth; timing.dmaVi = t.dmaVi; timing.dmaViWrite = t.dmaViWrite; timing.dmaViUnit = t.dmaViUnit;
+   timing.dmaViGap = t.dmaViGap; timing.dmaViGapWrite = t.dmaViGapWrite; timing.dmaViAA2 = t.dmaViAA2; timing.dmaViUnitAA2 = t.dmaViUnitAA2; timing.dmaViGapAA2 = t.dmaViGapAA2;
+   timing.viContendCpuI = t.viContendCpuI; timing.viContendCpuIAA2 = t.viContendCpuIAA2;
+   timing.contendDmaRead = t.contendDmaRead; timing.contendDmaReadUnit = t.contendDmaReadUnit; timing.contendDmaReadGap = t.contendDmaReadGap;
+-- 
+2.43.0
+

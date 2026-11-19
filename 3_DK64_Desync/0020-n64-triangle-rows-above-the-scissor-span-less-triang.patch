@@ -1,0 +1,229 @@
+From 0a6cdfcb07bb323e4f9dbb217960087e0d64042d Mon Sep 17 00:00:00 2001
+From: Nekokabu <nekokabu@gmail.com>
+Date: Sat, 14 Nov 2026 21:30:30 +0900
+Subject: [PATCH 20/32] n64: triangle rows above the scissor, span-less
+ triangles, depth spans by the depth buffer's megabyte (rdp_timing v50/v51)
+
+Console measurements of rdp_timing v50 (series G and F) and the chunk replays of v46/v51:
+
+- The RDP steps a triangle down from its top (YH) one row at a time and stops at the
+  scissor's bottom: a row above the scissor costs 9 clocks whatever the span width and
+  mode, a row below nothing. The first visible span's start-up overlaps the walk by 7
+  clocks (write-only, fill), 36 (IMAGE_READ) or 45 (depth). A triangle wholly above the
+  scissor costs 16 clocks + 9 per row. The MGC 2011 demo's background triangles start
+  10-20 rows above the screen: the leading chunk of seven replayed lists was 9,000 to
+  39,000 clocks short.
+- A triangle without a visible span costs what its command words take: 23.5 clocks for
+  the edge words alone, 66 with shade and texture, 76 with depth (it was 1-16).
+- v49 had the depth buffer in the colour buffer's megabyte; Donkey Kong 64, Beetle
+  Adventure Racing and the MGC demo all keep it in another. Measured there: a blend-only
+  span into a 320-pixel-wide image is 10 clocks cheaper than the tables + 15 (was 12), a
+  depth span into a wider image 5 (was 10); "Z compare without update + blend" costs the
+  blend-only span + 23 / 23 / 28 / 35 / 49 / 80 clocks passing and + 8 / 5 / 7 / 8 / 13 /
+  14 failing at 2 / 4 / 8 / 16 / 32 / 64 pixels; a failing depth span is 4 (320 wide) or
+  6 clocks cheaper than the tables' difference, and a compare-only span fails at the price
+  of a failing compare + update span.
+- Wider depth spans whose pixels partly fail save part of the writes (a quarter of the
+  pass - fail difference at 16 pixels, half at 32, three quarters from 64 on).
+- Same megabyte: 5% up to 8 pixels and 11.5% up to 16 into a wider image; compare-only
+  blended spans 10% (320 wide) / 5% (wider).
+- Fill spans: +1.0 clock per span (320 wide), +2.7 (wider), +0.014 per pixel (v44, v50).
+- Write-only spans narrower than 16 pixels are not widened by slanted edges (v32: apex
+  triangles cost no more than rectangles of their mean width).
+
+Replayed lists (full, VI off, ares - console, pass-rate estimator at its steady state):
+the 12 MGC lists mean -1.1% / rms 1.6% / worst -4.2% before, -0.05% / 0.84% / -1.8% now.
+---
+ ares/n64/rdp/rdp.hpp    |  9 ++++-
+ ares/n64/rdp/timing.cpp | 81 +++++++++++++++++++++++++++++++++--------
+ 2 files changed, 72 insertions(+), 18 deletions(-)
+
+diff --git a/ares/n64/rdp/rdp.hpp b/ares/n64/rdp/rdp.hpp
+index 4618918a..6407a67e 100644
+--- a/ares/n64/rdp/rdp.hpp
++++ b/ares/n64/rdp/rdp.hpp
+@@ -127,9 +127,14 @@ struct RDP : Thread, Memory::RCP<RDP> {
+     f64    writeOnlyTri = 0.0;       //extra clocks per write-only triangle: edges, shade words, texture words (+6: rdp_timing v44/v47/v48;
+     f64    writeOnlyShade = 0.0;     //the +5 / +7 / +30 of v32's one-row triangles are the triangle's least time in timingTriangle)
+     f64    writeOnlyTexture = 6.0;
+-    f64    blendOnlySpan = 12.0;     //a blend-only span (IMAGE_READ, no depth) is this much cheaper than the tables + spanPenalty, 320-pixel-wide colour image (rdp_timing v33/v40)
++    f64    fillSpan = 1.0;           //extra clocks per fill span, 320-pixel-wide colour image (rdp_timing v44/v50)
++    f64    fillSpanWide = 2.7;       //the same for a wider colour image
++    f64    fillPixel = 0.014;        //and per pixel of a fill span
++    f64    blendOnlySpan = 10.0;     //a blend-only span (IMAGE_READ, no depth) is this much cheaper than the tables + spanPenalty, 320-pixel-wide colour image (rdp_timing v50)
+     f64    blendOnlySpanWide = 7.0;  //the same for a wider colour image (rdp_timing v49)
+-    f64    depthSpan = 10.0;         //a depth span is this much cheaper than the tables + spanPenalty (rdp_timing v49)
++    f64    depthSpan = 10.0;         //a depth span is this much cheaper than the tables + spanPenalty (rdp_timing v49/v50)
++    f64    depthSpanWide = 5.0;      //the same for a colour image wider than 320 pixels (rdp_timing v50)
++    f64    rowAbove = 9.16;          //clocks per triangle row above the scissor (rdp_timing v50: 9.0 on DPC_CLOCK)
+     f64    clipRow = 11.0;           //clocks for a triangle row with no pixel inside the scissor (rdp_timing v48; v36: 88 for an 8-row triangle off screen)
+     f64    sameBankNarrow = 1.10;    //depth-tested span with the depth buffer in the colour buffer's megabyte of RDRAM, up to 8 px (rdp_timing v35)
+     f64    sameBank1 = 1.20;         //the same, wider spans, 1-cycle
+diff --git a/ares/n64/rdp/timing.cpp b/ares/n64/rdp/timing.cpp
+index 89d298cb..7cdd7a4b 100644
+--- a/ares/n64/rdp/timing.cpp
++++ b/ares/n64/rdp/timing.cpp
+@@ -63,7 +63,8 @@ auto RDP::timingReset() -> void {
+   timing.atomicCost = t.atomicCost; timing.aaSpanCost = t.aaSpanCost;
+   timing.writeOnlySpan = t.writeOnlySpan; timing.writeOnlySpanWide = t.writeOnlySpanWide;
+   timing.writeOnlyTri = t.writeOnlyTri; timing.writeOnlyShade = t.writeOnlyShade; timing.writeOnlyTexture = t.writeOnlyTexture;
+-  timing.blendOnlySpan = t.blendOnlySpan; timing.blendOnlySpanWide = t.blendOnlySpanWide; timing.depthSpan = t.depthSpan; timing.clipRow = t.clipRow;
++  timing.blendOnlySpan = t.blendOnlySpan; timing.blendOnlySpanWide = t.blendOnlySpanWide; timing.depthSpan = t.depthSpan; timing.depthSpanWide = t.depthSpanWide; timing.clipRow = t.clipRow; timing.rowAbove = t.rowAbove;
++  timing.fillSpan = t.fillSpan; timing.fillSpanWide = t.fillSpanWide; timing.fillPixel = t.fillPixel;
+   timing.sameBankNarrow = t.sameBankNarrow; timing.sameBank1 = t.sameBank1; timing.sameBank2 = t.sameBank2;
+   timing.loadStride = t.loadStride; timing.loadStrideWide = t.loadStrideWide;
+   timing.colorSize = 2;
+@@ -194,28 +195,41 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+       //cost (rdp_timing v24), so partial occlusion saves nothing. Only short spans are hidden as a
+       //whole (Donkey Kong 64's small triangles: -17% on the console, v28), so the estimated pass rate
+       //is applied to spans up to zFailWidth pixels and wider spans always pay the passing cost.
+-      if(w <= (s32)timing.zFailWidth) cost += (fail - pass) * (1.0 - timing.zPassFraction);
++      //A failing span is 4 clocks cheaper than the tables' difference into a 320-pixel-wide colour image and 6 into
++      //a wider one. A wider span is rarely hidden as a whole, but its failing pixels still save part of the writes:
++      //a quarter of the difference at 16 pixels, half at 32 and three quarters from 64 on (rdp_timing v50: 512
++      //overlapping triangles at one depth, 3-74% of their pixels failing).
++      if(w <= (s32)timing.zFailWidth) cost += (fail - pass - (stride > 640 ? 6.0 : 4.0)) * (1.0 - timing.zPassFraction);
++      else {
++        f64 g = w >= 64 ? 0.75 : w >= 32 ? 0.5 + 0.25 * (w - 32) / 32.0 : 0.25 + 0.25 * (w - 16) / 16.0;
++        cost += (fail - pass) * g * (1.0 - timing.zPassFraction);
++      }
+     } else if(timing.zCompare && timing.imageRead) {
+       //depth compare without update on a blended span (the MGC 2011 demo's particles, decals): on the console
+-      //it costs the blend-only span plus the depth read, +28 clocks up to 4 pixels, +33 at 8, +43 at 16 and
+-      //+63 at 32 when the test passes and +11 / +10 / +13 / +15 / +25 when it fails, the same in the demo's,
+-      //Donkey Kong 64's and Beetle Adventure Racing's modes (rdp_timing v49). Adding "compare-only minus
+-      //pass" to the blend-only table, as for the unblended case below, came out cheaper than no depth test.
+-      auto lerp = [&](f64 a2, f64 a4, f64 a8, f64 a16, f64 a32) -> f64 {
++      //it costs the blend-only span plus the depth read, +23 clocks up to 4 pixels, +28 at 8, +35 at 16, +49
++      //at 32 and +80 at 64 when the test passes and +8 / +5 / +7 / +8 / +13 / +14 when it fails, the same in the
++      //demo's, Donkey Kong 64's and Beetle Adventure Racing's modes, with the depth buffer in another megabyte
++      //than the colour buffer as in all three games (rdp_timing v50; v49 had measured the same megabyte).
++      //Adding "compare-only minus pass" to the blend-only table, as for the unblended case below, came out
++      //cheaper than no depth test.
++      auto lerp = [&](f64 a2, f64 a4, f64 a8, f64 a16, f64 a32, f64 a64) -> f64 {
+         if(w <= 2) return a2;
+         if(w <= 4) return a2 + (a4 - a2) * (w - 2) / 2.0;
+         if(w <= 8) return a4 + (a8 - a4) * (w - 4) / 4.0;
+         if(w <= 16) return a8 + (a16 - a8) * (w - 8) / 8.0;
+-        return a16 + (a32 - a16) * (w - 16) / 16.0;  //and on at the 16-32 slope
++        if(w <= 32) return a16 + (a32 - a16) * (w - 16) / 16.0;
++        return a32 + (a64 - a32) * (w - 32) / 32.0;  //and on at the 32-64 slope
+       };
+       f64 f = w <= (s32)timing.zFailWidth ? timing.zPassFraction : 1.0;
+-      cost += lerp(27.6, 28.3, 33.4, 43.2, 63.5) * f + lerp(11.3, 10.1, 12.6, 15.3, 25.2) * (1.0 - f);
++      cost += lerp(23.0, 23.2, 28.0, 35.1, 49.2, 79.8) * f + lerp(7.6, 5.4, 6.7, 7.8, 12.6, 13.7) * (1.0 - f);
+       compareBlend = true;
+     } else {
+       auto partial = timing.zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD;
+       f64 ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
+       f64 scaled = rdp_tm_span(partial, address, w) * (ref > 0.0 ? pass / ref : 1.0);
+       cost += scaled - pass;
++      //a compare-only span whose pixels all fail costs what a failing compare + update span costs (rdp_timing v50)
++      if(timing.zCompare && w <= (s32)timing.zFailWidth) cost += (fail - scaled - (stride > 640 ? 6.0 : 3.0)) * (1.0 - timing.zPassFraction);
+     }
+   }
+ 
+@@ -226,17 +240,23 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+   if(timing.memoryBound) {
+     cost += timing.spanPenalty;
+     //with the pixels outside the scissor charged (timingTriangle), the per-span prices can follow the
+-    //synthetic frames instead of making up for them: a blend-only span (IMAGE_READ, no depth) is 12 clocks
+-    //cheaper than the tables + 15 into a 320-pixel-wide colour image and 7 into a wider one (rdp_timing
+-    //v33/v40/v49), a depth span 10 (v49: 7-16 passing, 12-20 failing, up to 16 pixels, in three games' modes)
++    //synthetic frames instead of making up for them: a blend-only span (IMAGE_READ, no depth) is 10 clocks
++    //cheaper than the tables + 15 into a 320-pixel-wide colour image and 7 into a wider one, a depth span 10
++    //and 5 (rdp_timing v49/v50: spans of 2-64 pixels in three games' modes, depth buffer in another megabyte)
+     if(!(timing.zCompare || timing.zUpdate) || compareBlend) cost -= stride > 640 ? timing.blendOnlySpanWide : timing.blendOnlySpan;
+-    else cost -= timing.depthSpan;
++    else cost -= stride > 640 ? timing.depthSpanWide : timing.depthSpan;
+     if(timing.zCompare || timing.zUpdate) {
+       //the depth buffer in the same megabyte of RDRAM as the colour buffer: every depth-tested span costs
+       //10% more up to 8 pixels and 16.5% (2-cycle) / 20% (1-cycle) more beyond, whatever the distance inside
+-      //the megabyte (rdp_timing v24/v35); 4 MiB games commonly place both in the same megabyte
++      //the megabyte (rdp_timing v24/v35); 4 MiB games commonly place both in the same megabyte. Into a colour
++      //image wider than 320 pixels it is 5% up to 8 pixels and 11.5% up to 16, and a compare-only blended span
++      //pays 10% (320 wide; 11.5% beyond 16 pixels) or 5% (wider; 9% beyond 16) (rdp_timing v50).
+       u32 depthRow = timing.depthAddress + y * (timing.colorWidth + 1) * 2;
+-      if((depthRow >> 20) == (address >> 20)) cost *= w <= 8 ? timing.sameBankNarrow : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
++      if((depthRow >> 20) == (address >> 20)) {
++        if(compareBlend) cost *= stride > 640 ? (w <= 16 ? 1.05 : 1.09) : (w <= 16 ? timing.sameBankNarrow : 1.115);
++        else if(stride > 640) cost *= w <= 8 ? 1.05 : w <= 16 ? 1.115 : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
++        else cost *= w <= 8 ? timing.sameBankNarrow : timing.cycleType ? timing.sameBank2 : timing.sameBank1;
++      }
+     }
+   }
+   else if(timing.cycleType < 2) {
+@@ -245,6 +265,11 @@ auto RDP::timingSpan(s32 x, s32 y, u32 pixels) -> f64 {
+     //one (rdp_timing v31/v32: the MGC 2011 demo's 640x480 parts)
+     cost += stride > 640 ? timing.writeOnlySpanWide : timing.writeOnlySpan;
+   }
++  else if(timing.cycleType == 3) {
++    //fill spans cost more than the tables on the console: +1.0 clocks per span into a 320-pixel-wide colour
++    //image, +2.7 into a wider one, and +0.014 per pixel (rdp_timing v44: widths 16-638; v50: fill triangles)
++    cost += (stride > 640 ? timing.fillSpanWide : timing.fillSpan) + timing.fillPixel * w;
++  }
+ 
+   timing.framePixels += pixels;
+   return cost;
+@@ -267,11 +292,24 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+ 
+   s32 rowStart = (s32)floor(fyh);
+   s32 rowEnd   = (s32)ceil(fyl);
++  //rows cut off by the scissor in Y: the RDP steps a triangle down from its top one row at a time and stops at
++  //the scissor's bottom, so the rows above the scissor cost 9 clocks each and the rows below nothing (rdp_timing
++  //v50; the MGC 2011 demo's background triangles start 10-20 rows above the screen: 1-3% of a list, v46)
++  s32 rowsAbove = (rowEnd < (s32)timing.scissorY0 ? rowEnd : (s32)timing.scissorY0) - rowStart;
++  if(rowsAbove < 0) rowsAbove = 0;
++  if(rowsAbove > 1024) rowsAbove = 1024;  //guard against garbage
+   if(rowStart < timing.scissorY0) rowStart = timing.scissorY0;
+   if(rowEnd   > timing.scissorY1) rowEnd   = timing.scissorY1;
+   if(rowEnd - rowStart > 1024) rowEnd = rowStart + 1024;  //guard against garbage
++  bool rowsInside = rowEnd > rowStart;
+ 
+   f64 cycles = 0.0;
++  if(rowsAbove && rowsInside) {
++    //the first span's start-up overlaps the walk: 7 clocks (write-only, fill), 36 (IMAGE_READ), 45 (depth)
++    f64 overlap = timing.cycleType < 2 && (timing.zCompare || timing.zUpdate) ? 45.0 : timing.cycleType < 2 && timing.imageRead ? 36.0 : 7.0;
++    f64 walk = timing.rowAbove * rowsAbove - overlap;
++    if(walk > 0.0) cycles += walk;
++  }
+   u32 widest = 0, spans = 0;
+   for(s32 row = rowStart; row < rowEnd; row++) {
+     f64 yc = row + 0.5;
+@@ -283,7 +321,9 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     //the RDP walks each row as four sub-scanlines and the span it writes runs from the leftmost to the
+     //rightmost edge position among them, so a slanted edge widens the span: on the console a triangle whose
+     //edges move 8 px per row costs like one 6 px wider (rdp_timing v36), and the games' lists come out
+-    //1-3% dearer than the centre-line width says (v37/v38)
++    //1-3% dearer than the centre-line width says (v37/v38). Write-only spans narrower than 16 pixels do not
++    //widen: apex triangles 1-32 pixels wide cost no more than rectangles of their mean width (v32)
++    f64 x0c = x0, x1c = x1;
+     for(s32 k = 0; k < 4; k++) {
+       f64 ys = row + 0.125 + 0.25 * k;
+       if(ys < fyh || ys >= fyl) continue;
+@@ -293,6 +333,7 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+       if(a < x0) x0 = a;
+       if(b > x1) x1 = b;
+     }
++    if(x1c - x0c < 16.0 && !timing.memoryBound) { x0 = x0c; x1 = x1c; }
+     //the scissor does not make the cut-off part of a span free (rdp_timing v46-v48). The RDP walks a span from
+     //the major edge (XH): the pixels in front of the scissor on that side go by at the pipeline rate (1 clock
+     //per pixel in 1-cycle mode, 2 in 2-cycle, about 0.5 in fill / copy), what sticks out beyond the far scissor
+@@ -347,6 +388,14 @@ auto RDP::timingTriangle(const u64* ops, bool shade, bool texture, bool zbuffer)
+     f64 least = 15.0 + (shade ? 9.0 : 0.0) + (texture ? 31.0 : 0.0) + (timing.imageRead ? 10.0 : 0.0) + 11.0 * (f64)spans;
+     if(cycles < least) cycles = least;
+   }
++  if(spans == 0) {
++    //a triangle without a visible span still has its command words taken in: 23.5 clocks for the edge words alone,
++    //66 with shade and texture, 76 with depth, whatever the number of rows below the scissor; one wholly above the
++    //scissor is walked down to its last row: 16 clocks + 9 per row (+43 with ATOMIC_PRIM) (rdp_timing v50)
++    f64 least = shade || texture || zbuffer ? 16.3 + (shade ? 9.0 : 0.0) + (texture ? 31.0 : 0.0) + (zbuffer ? 10.0 : 0.0) + 11.0 : 23.5;
++    if(rowsAbove && !rowsInside) cycles = 16.0 + timing.rowAbove * rowsAbove + (timing.atomicPrim ? 43.0 : 0.0);
++    if(cycles < least) cycles = least;
++  }
+   timingAdd(cycles);
+ }
+ 
+-- 
+2.43.0
+
